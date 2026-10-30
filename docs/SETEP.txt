@@ -1,0 +1,1777 @@
+SETEP
+
+Setep is a compact notation for describing neural-network computation, data
+flow, parallelism, repetition, and communication.
+
+SUMMARY
+
+Name              String starting with an alpha character and containing same case alfa characters, digits, _, and '.
+Number            A string of digits forming a positive integer like 5, 16 or 256
+Scalar            A single numeric value represented by either a number or a lowercase name.
+                  Scalars are used as dimensions and split counts in tensor and weight shape definitions and as repetition counts for tensors, weights, computations and scopes.
+                  Examples: 12, n, a_b
+Tensor            Tensor of one or more dimensions represented as and upper case name. A vector is a one dimensional tensor. A matrix is a two dimensional tensor.
+                  Examples: Q, A_B
+Weight            A persistent parameter tensor of one or more dimensions. Weights may be arithmetic operands or members of groups passed to computations.
+                  Weights are always persistent and never take the ! suffix. A weight declared without an array has one value wherever it is used;
+                  weights that differ between instances are declared as arrays, for example q[layers], and selected with [] or by an indexed call.
+                  Examples: q, a_b
+Gradient          Tensor or weight representing the change in a value. Name is same format as tensor or weight but ends in '.
+                  Examples: Q', q'
+                  Note that ' is part of an identifier. Setep does not enforce gradient semantics.
+Array             An array of tensors or weights. Name format is the same as tensor or weight name format.
+                  Elements of arrays are only accessed inside repeated scopes or computations and are the array name followed by [] which represents the repetition iteration.
+Group             Heterogeneous group of either tensors, weights, arrays of tensors or arrays of weights, including gradients. Members of groups are separated by :.
+                  Examples: q:k:v, Q:K:V, q':k':v', Q[]:K[]:V[]
+Value             A tensor, weight, gradient, array or group.
+Persistent value  A tensor that maintains its state across computation evaluations. Persistent tensors end in ! except possible [].
+                  Weights are persistent without the suffix; ! on a weight is an error.
+                  Examples: Q!, Q'!, Q![]
+Computation       Function that takes a value as input, operates on it and returns a value with possibly a different shape as output.
+                  Computations are represented by upper case names.
+                  A computation in a reverse chain may end in '.
+                  Examples: GELU, GELU'
+Shape             Shapes specify logical dimensions, optional per-dimension split counts, and the datatype.
+                  Examples: 100%200@fp16, 100[4]%200@fp8, 100[4]%200[4]@fp8
+Definition        There are three kinds of defintions:
+                  Scalar definitions set the value of a scalar, for example width = 11
+                  Tensor and weight definitions set the shape and datatype of the tensor or weight, for example A = 100%200@fp8
+                  An array definition adds the element count, for example A[10] = 200@fp8 or q[layers] = width%width@fp32
+                  Computation definitions define what a computation does, for example MULT(A:B) {A*B}.
+                  The parenthesized parameters name the computation's tensor inputs; calls pass no arguments in the parentheses, as in X:Y >> MULT().
+                  The parentheses are required and are empty when the computation takes no tensor input, for example TOKEN_WEIGHTS() {wte}.
+                  In tensor and weight definitions numbers can be replaced by defined scalers, for example A = width%100@int8
+
+Types and shapes of values and computation inputs/outputs are determined by name, definition and context.
+
+OPERATORS
+
+Operators operate on value arguments and result in a value.
+Operators don't change argument values.
+The resulting shape is determined by the operator and the shape of operands.
+Operation results can be consumed by another operation, transferred to a value or serve as the input to a computation.
+An operation result must be transferred to a value to be referenced explicitly later.
+
+A^                  Transpose of A. Only applies to the immediately preceding tensor.
+*A                  Matrix multiplication
+A*B                 Matrix multiplication
++A                  Matrix addtion
+A+B                 Matrix addition
+A-B                 Matrix subtraction
+A*B+C               Matrix multiplication and addition
+A*B:C               Result is (A*B):(A*C)
+
+An operator with no LHS argument operate on the input to the computation it is in.
+Expressions are evaluated strictly from left to right with no operator precedence except ^.
+An operator applied to an array or group is independently applied to every array element or group member using the same input. The result is an array or group with the same size. 
+
+REPETITION
+
+[n] following a tensor or weight declares an array of n tensors or weights,
+either in a definition such as q[layers] = width%width@fp32 or in an expression.
+/ and \ following a scope specify forward and reverse iteration direction.
+/n following a scope denotes n repeated evaluations of the computation or scope with arrayed tensors or weights evaluated in order. The output of each evaluation serves as the input to the next evaluation.
+\n is similar and can only follow a scope. It evaluates tensors or weights inside the computation or scope in  reverse order. The result is the last evaluation.
+/n[] following a scope denotes n repeated evaluations with the results placed in an array with n elements.
+\n[] is similar but reversed. The count in /n[] or \n[] may be omitted when
+an input array supplies it; see SCOPES.
+Values followed by [] within a repeated scope must reference and array that has the same size as the scope repetition count and are evaluated as the ith element of the array during the ith evaluation of the scope.
+Tensors without [] are shared by every evaluation of a repeated scope. A weight
+declared without an array is shared by every evaluation; an array weight named
+without [] takes the instance of the enclosing indexed call.
+
+A >> *q:k:v >[12]> Q:K:V; REPEAT/12[]{Q[]*K[]^ >> SOFTMAX() >> *V[]}
+
+In this example the input A is multiplied independently by weights q, k, and v, and each member of the resulting group is split into 12 tensors using its last dimension and assigned to tensor arrays Q, K, and V.
+Inside the scope each element of Q and K transpose array are multiplied, SOFTMAX (not arrayed) is applied to the product and the SOFTMAX result is multiplied by the array element for V. The 12 results from the repetition are placed in an array of size 12.
+
+TRANSFER
+
+>> describes transfer to a tensor or to the input of a computation.
+
+A >> *a >> B
+A >> N{*a >> B}
+A >> *a >> A
+
+The following rules specify the bracket-based transfer semantics used by
+normalization, semantic analysis, and the source and graph generators.
+These meanings replace the earlier merging >> and corresponding >:> meanings.
+
+>>       Transfer without changing group or array structure. Group members bind
+         positionally to matching destination members. Arrays retain their
+         elements, shapes, and partition layout; no implicit concatenation occurs.
+>[n]>     Split each source tensor along its last dimension into n equal array
+         elements. n is a positive integer or defined scalar and must divide
+         that dimension exactly. A source group retains its group structure.
+>[]>      Concatenate array elements, retaining any surrounding group structure.
+         For ordinary arrays and arrays made by a last-dimension split,
+         concatenate the last dimension; other tensor dimensions must match.
+         Explicit array partitions retain their split-axis metadata so combination
+         reconstructs the logical tensor along the original split dimensions.
+>:>      Concatenate group members along the last tensor dimension. Members must
+         have equal rank and equal dimensions except for the last dimension.
+         For matching arrays, concatenate corresponding tensor elements and
+         retain the array layout. Incompatible shapes or layouts are errors.
+>+[]>     Reduce an array by elementwise addition. Elements must have matching
+         shapes. A group of arrays is reduced member by member, retaining the group.
+
+The [] qualifier identifies an array operation; it does not promise an array
+result. The : qualifier identifies group concatenation. Neither qualifier
+implicitly performs the other operation.
+
+A:B >> F() passes a group to F. If A and B are arrays and F accepts local
+tensors, corresponding elements are paired for each invocation; their layouts
+must match. Non-array inputs are shared. A computation explicitly accepting an
+array receives the array as a whole. Transfer itself does not change shapes;
+the receiving computation may change its result shapes.
+
+A:B >[]> T; T >:> C combines each array separately into the intermediate group
+T, then concatenates that group's tensors into C. The compound operator >/:>
+is not supported. Use an intermediate result when both operations are needed.
+
+The older forms >n>, >n:>, >+>, and >+:> are semantic errors, even if accepted
+by the parser. Diagnostics should recommend >[n]> or >+[]> as appropriate.
+The slash-based forms >n/>, >/>, and >+/> are superseded by >[n]>, >[]>,
+and >+[]> respectively. >+[n]> is invalid: reduction does not take a split count.
+There is no group reduction transfer. Use explicit addition for adding group members.
+
+ARRAYS
+
+The parts of an array are called elements.
+Array element types are homgeneous.
+Names of arrays of values have the same format as names of the values.
+An array can be declared by following a value with [n] where n is the array size, for example A[5].
+A definition gives the array size and element shape together:
+A[10] = 200@fp8 declares ten tensors of shape 200@fp8, and
+q[layers] = width%width@fp32 declares one weight per layer. Definitions can be
+global or local to a computation. The count is required ([] is not valid in a
+definition) and the shape needs a @dtype. A value bound to a declared tensor
+array must be a single layer array of that size with elements of the declared
+shape; a parameter declared this way receives the whole array. A declared
+weight array fixes the count that q[] is checked against inside a repetition
+and that any q[n] read must match. An array weight named without [] refers to
+the current instance's weight, so a computation called per layer, such as
+MLP[](), reads its own layer's weights by plain name. A weight declared without
+an array has a single value, even inside a repeated scope or an indexed call;
+declare per-layer weights as arrays.
+Inside a shape, [n] also describes an array: A = 100[5]@fp8 is five tensors
+of shape 20@fp8. The array retains the logical shape and split-axis metadata.
+An array can also be created using an array split transfer, for example A >[5]> B splits A into an array of 5 tensors
+Splitting is done along the last dimension of the shape. For example for
+A = 100%200@int8; A >[5]> B
+B is an array of 5 tensor with shape 100%40
+If an array is transferred using >[]> its elements are concatenated. In the example above for
+B >[]> C
+C is a tensor with shape 100%200
+To transfer an array and maintain size and shapes use >>. So for
+B >> D
+D is an array of 5 tensors with shape 100%40
+A[4] declares four elements; A[] selects the current iteration's element.
+Explicit numeric indexing is not supported. Empty brackets replace the former
+# suffix everywhere an iteration element is referenced, including A'[], A![],
+w[], w'[], and indexed calls F[]().Group members have independent
+suffixes: A[]:B[] pairs current elements, while A[]:B shares the whole B.
+Weight groups likewise permit a[]:b[]. Transpose follows element selection,
+as in A[]^ and w[]^; ordinary A^ and w^ remain valid.
+
+Operations and computations that take a tensor operate elementwise when applied to an array, producing an array of the same size.
+Computations that take an array receive the whole array.
+
+GROUPS
+
+: separates members of a group. A group may mix tensors, weights, and computation results in any order.
+Group member shapes can be heterogeneous. Weight declarations and lowercase naming are unchanged.
+
+A:B():C
+q:k:v
+
+Operations or computation that take a tensor applied to a group operate on each member individually and the result is a group of the same size.
+
+For example.
+
+A >> *q:k:v >> Q:K:V
+
+A:B:C >> EMBED() >> D:E:F
+
+Computations that require a group must receive a group of the same size.
+Computations that require an array must receive an array.
+
+The members of a group transferred to a computation must be named in the first line of the computation.
+
+ADD(A:B) {
+    A+B
+}
+
+X:Y >> ADD() >> Z
+
+Group members bind positionally: X is named A and Y is named B inside ADD.
+Weights bind in the same way: X:w >> ADD() names X as A and the weight w as B.
+Passing a weight does not copy it or concatenate it with the other members, and
+its parameter identity and persistence are retained. A named group also retains
+these references, for example X:w >> PAIR; PAIR >> ADD() >> Z.
+
+A direct normalization call can therefore be written as:
+    QL:moe_layer_q_norm >> RMSNORM() >> QNORM;
+instead of first transferring moe_layer_q_norm to a temporary tensor name.
+
+Each member keeps its own suffixes, for example A[]:w[], A:w^, and K!:A.
+Weights follow the array ownership rules above.
+In a computation's first expression, uppercase members bind incoming values;
+lowercase weight members refer to that computation's weights, not extra formal
+parameters. Use uppercase formal names, such as A:B above, to accept a weight
+supplied by the caller. Scalars are not members of mixed tensor/weight groups.
+
+A mixed destination group binds positionally too. A:B >> C:w assigns A to C
+and explicitly updates w from B, following the existing weight-update rules.
+Reading or passing w never updates it. Updates through transposed weight
+references are rejected; update a weight-array element inside an explicit scope.
+
+For shape-partitioned inputs, behavioral calls receive logical tensors; see SPLIT TENSORS.
+
+SCOPES
+
+A scope is everthing inside { and }.
+
+{A >> *a}                The input to the scope is named A and is multiplied by a
+{*a}                     The input to the scope is unnamed the scope
+{A; A*a}                 The input to the scope is named A
+{*up >> GELU() >> *down}   Sequential computation where results of one expression is input to the next
+N{*a >> A!}            The scope is named N and has persistent tensor A
+REPEAT/n{*a[]}         The scope is repeated n times and each result is the input to the next repetition
+N/n{*a[] >> A!}        Named scope N repeated n times
+KV{*k:v >> K!:V!}       Named scope defining persistent tensors K! and V!
+
+A value at the beginning of a scope names the scope input. Computation definitions name their inputs with parameters instead, as in MULT(A:B) {A*B}.
+The value can be a tensor, group or array.
+The value can be transferred to a succeeding expression using >> or can just be named and followed by a semicolon and used inside the scope.
+Values ending in ! inside a named scope are persistent and can be accessed in another scope with the same name.
+If a named scope occurs inside a repeated scope, later references to it must occur inside a corresponding repetition structure. Corresponding named repetitions must have matching sizes at each level, and corresponding instances refer to the same persistent state.
+When the weight a is arrayed using [], it is equivalent to using a0 through a(n-1) in the n repetitions.
+Repetition and selection prefix the scope body: NAME/n{...} for a named scope,
+or REPEAT/n{...} for an unnamed one. REPEAT and CHOOSE are reserved; they
+permit a repetition or selector but leave the scope unnamed, so REPEAT/n{...}
+behaves as an unnamed scope and gets no persistent state of its own. REPEAT
+requires a repetition and CHOOSE requires a selector (see CHOICES).
+When /n or \n precedes a scope body, repetitions are sequential and each output becomes the input to the next repetition.
+Sequential repetitions output the last result of then repeated scope.
+Names local to the repeated computation or scope therefore do not become arrayed merely because it is repeated.
+When /n[] or \n[] precedes a scope body, it creates n peer instances and produces an array of size n. [] identifies names that vary with and correspond to those instances.
+For array-producing repetition, the count may be omitted: REPEAT/[]{...} iterates
+forward and REPEAT\[]{...} iterates backward. Infer the count from the input array's
+current outer array dimension. Multiple array inputs must have matching layouts
+and are paired by index; non-array inputs are shared across iterations. Without
+an array input, omission of the count is an error. Referencing an external array
+with [] alone does not supply an inferred input count; use an explicit count.
+An explicit count must match the iterated dimension of any input array.
+Counts must resolve to positive integers. Sequential /n and \n still require n.
+
+Each repeated scope iterates one array dimension. Nested scopes handle further
+array dimensions. Reverse iteration changes execution order, not output layout:
+the result for index i remains at index i. Explicit-count peer repetition with
+no array input remains valid and shares the input across its instances.
+
+Examples:
+A >[4]> REPEAT/[]{F()} >> B     Infer four instances; B retains four results
+A >> REPEAT\[]{F()} >> B        Infer A's array length; visit indices in reverse
+A >> REPEAT/n[]{F()} >> B       Require n to match A's outer array length
+
+The postfix form {...}/n is no longer accepted; write REPEAT/n{...}. The old
+array-producing suffixes /:n and \:n are invalid. Bare / or \ with neither a
+count nor [] is a semantic error.
+
+A tensor is visible from the point of its definition to the end of its enclosing scope, including nested scopes. It is not visible outside that scope.
+
+CHOICES
+
+Choices are alternative operations inside a scope.
+Each choice operates on the input to the scope plus any named values available in the scope.
+MoE token routing uses dispatch, peer repetition, and recombination.
+
+Choices are enumerated alternatives separated by | inside a scope, preceded by a computation that selects one alternative.
+The selector follows the scope name: CHOOSE?SELECT[](){...} for an unnamed scope, or NAME?SELECT[](){...} for a named one.
+
+A >> CHOOSE?SELECT[](){E1()*e1 | E2()*e2 | E3()*e3} >> B
+
+Enumerated choices executes exactly one choice as its output.
+Selecting multiple or no alternative is an error.
+SELECT[] is a computation that uses the scope input and the choice index to determine which choice is executed.
+SELECT[] returns a tensor with the single value 1 or 0 where 1 selects the choice and 0 does not.
+
+Each alternative can contain indexed tensors, weights and computations.
+A selector cannot be combined with a repetition count on the same scope.
+Use a surrounding repeated scope when repeating an explicit choice.
+
+DEFINITIONS
+
+Definitions are names followed by = and the definition body.
+The scope in which a definition appears determines its scope.
+
+A lowercase definitions followed by an integer defines a scalar.
+Scalars must be positive.
+Scalars can be used as dimensions, split counts, and repetition counts.
+n = 12
+layers = 12
+
+A lowercas definition followed by a shape define a weight shape.
+w = model_width%mlp_width@fp16
+
+An uppercase definition followed by a shape declares a tensor shape.
+
+ABC = 100%200@fp16
+D = 100%20@fp8
+TOKENS = n@int8
+PARTITIONED = 100[4]%200@fp8
+w_split = model_width[parts]%mlp_width@fp16
+
+Each shape dimension may be followed by a split count in brackets. See SPLIT TENSORS.
+
+Shapes require @ followed by a lowerName datatype label.
+Datatypes include are either int, fp or bp, followed by an number, for example int8, fp4, bp16.
+
+An uppercase defintion followed by parentheses defines a computation. The
+parentheses are required; without them NAME{...} names a scope. They list the
+tensor inputs and are empty when there are none.
+Empty computations are abstract and are implemented elsewhere, for example in python.
+An abstract computation's parameters fix how many inputs each call passes; its
+outputs follow from where the result goes, as in TOKENIZE(TEXT) {} with
+TEXT >> TOKENIZE() >> IDS:MASK:POSITIONS. A selector, as in CHOOSE?SEL(){a | b},
+receives the scope's input and declares one parameter: SEL(A) {}.
+With empty parentheses an abstract computation takes no input, so its result
+must be transferred to a declared tensor, which gives its shape:
+
+R = 4%8@fp32
+RANDOM() {}
+RUN(A) { RANDOM() >> R; A+R }
+
+DEF(A) { A >> *B }
+HGI(A) {}
+
+A call that needs the calling scope's index path uses F[](). Within that
+computation, references such as A[] use the supplied iteration context.
+The computation definition retains its ordinary name, for example F(A) {...}.
+Element references inside a computation's own repeated scopes use those scopes'
+iteration contexts.
+
+An abstract computation is shape-preserving unless its receiving tensor has a
+declared size. A declared receiver supplies the computation's output size.
+Equal-size operations, transfers, residual additions, head splitting, and
+matrix multiplication propagate sizes to otherwise undeclared tensors and
+weights.
+
+The last computation definition in a SETEP model is the entry point. It may
+invoke computation definitions that appear earlier in the file. Invoking a
+defined computation expands its body; the invocation does not create an
+additional computation. For example, ATTENTION is the entry point below:
+
+ATTENTION(A)
+  {
+    A >>
+    *q:k:v >[12]> Q:K:V >>
+    REPEAT/12[]{Q[]*K[]^ >> SOFTMAX() >> *V[]} >[]>
+    *o+A >> B
+  }
+
+
+SPLIT TENSORS
+
+This section specifies the agreed implicit tensor-parallelism semantics.
+Shape splits describe partition intent on a logical tensor, not an explicit array.
+Behavioral Python executes operations on the full logical tensors.
+
+1. Shape declarations and validation
+
+A dimension is written as size or size[splits]. Both cards may be positive
+integer literals or previously defined scalars. An omitted split count is 1;
+writing [1] is equivalent to omitting it. Zero, negative, unresolved, or
+noninteger split counts are errors. Each logical dimension must be evenly
+divisible by its split count; uneven partitions and implicit padding are not
+allowed.
+
+The size before [splits] is the full logical dimension, not the local partition size.
+Splits on different dimensions are independent. The partition count is the
+product of the per-dimension split counts.
+
+Declaration                  Logical shape   Partition grid   Local shape
+A = 100[4]%200@fp8            100 x 200       4 x 1            25 x 200
+A = 100%200[4]@fp8            100 x 200       1 x 4            100 x 50
+A = 100[4]%200[4]@fp8         100 x 200       4 x 4            25 x 50
+
+The last example has 16 partitions. These are logical partitions; their mapping
+to processors is a separate placement decision. The same shape syntax applies
+to weights. Existing declarations without splits retain their meaning.
+
+Named constants can supply either card:
+
+rows = 100
+cols = 200
+parts = 4
+A = rows[parts]%cols@fp8
+
+A lowercase integer definition such as parts = 4 remains a scalar definition.
+A split shape is a tensor or weight shape and requires a datatype annotation.
+
+2. Transfer and inference
+
+For A >> B, if B is undefined, B inherits A's logical dimensions, datatype,
+and per-dimension split counts. There is no gather or concatenation of A's
+partitions. If B is explicitly declared, its logical dimensions and split
+counts must match A's; conflicting declarations are errors. Transfer does not
+silently repartition, merge partitions, or change logical dimensions.
+
+For example, given A = 100[4]%200@fp8:
+
+A >> B                      B inherits logical shape 100 x 200 and grid 4 x 1
+C = 100[4]%200@fp8            A >> C is valid
+D = 100%200@fp8              A >> D is an error: different split counts
+E = 100%200[4]@fp8            A >> E is an error: different split dimensions
+F = 200[4]%200@fp8            A >> F is an error: different logical dimensions
+
+Shape partition metadata is distinct from explicit arrays. A[4] declares an
+array of independent tensors; A >[4]> B creates an explicit array by splitting
+the last dimension. These forms retain their existing behavioral loops,
+element references, and concatenation/reduction operators. A dimension such
+as 100[4] does not make A[] a valid array-element reference and does not supply
+an inferred array-scope count. >[]> combines explicit arrays.
+
+3. Behavioral execution and distributed lowering
+
+For A = 100[4]%200@fp8, behavioral Python passes the full 100 x 200 tensor into
+a computation. Its split annotation does not introduce Python loops or alter
+the operation's mathematics.
+Explicit arrays still map computations over their elements.
+
+Distributed execution must lower each operation according to its dimensions
+and partition intent. For multiplication A*a, splitting a contracted dimension
+requires corresponding slices of a and a sum of partial products. Splitting
+an output dimension instead preserves output partitions. Softmax along a
+split normalization axis requires global maximum and sum operations, rather
+than independent local softmax calls. Opaque operations need a partition rule
+or a defined gather boundary; arbitrary calls cannot safely be mapped locally.
+
+Implementation status: behavioral Python retains full logical tensors.
+The shared physical lowering supports matrix multiplication with independent
+splits on either axis of either operand, and vector times matrix multiplication.
+For A of shape M x K and a of shape K x N:
+- A's row split count becomes the output's row split count.
+- a's column split count becomes the output's column split count.
+- Splits on the contracted K dimension produce partial products and a sum
+  reduction within each output tile. If only one operand splits K, the other
+  is sliced correspondingly. Two non-unit K split counts must match.
+
+Undefined outputs inherit the inferred logical shape M x N and output split
+grid. Subsequent multiplications consume those output tiles directly. A
+conflicting declared output shape or split grid is an error, including an
+explicitly unsplit declaration when the inferred output is split. Scalar
+aliases for equal dimensions and split counts are equivalent. These checks
+also apply during behavioral source generation.
+
+For example, A=12[3]%100[4]@fp8 and a=100%8[2]@fp8 produce an inferred
+B=A*a of logical shape 12 x 8, grid 3 x 2, and local shape 4 x 4. Physical
+lowering emits 24 local products and six reductions; each reduction combines
+four products for one output tile. No global concatenation operation or implicit
+redistribution is inserted between chained multiplications. Source validation
+assembles a logical view of the output for comparison with unsplit Python.
+
+Partitioned elementwise addition/subtraction, scalar multiplication, and
+matrix transpose are also supported. Elementwise broadcasting follows logical
+trailing dimensions: singleton axes are shared and unsplit operands are sliced
+to the result grid. Conflicting non-unit split counts on the same axis are
+errors. Transpose exchanges both tensor dimensions and grid axes, retaining
+the tile producer dependencies. Explicit-array behavior is unchanged.
+Partitioned custom calls/control-flow, matrix-vector, and batched/higher-rank
+partitioned products remain unsupported.
+
+Example:
+A = 100[4]@fp8
+a = 100%8@fp8
+RUN(A) {A*a >> B}
+
+Behavioral execution evaluates the full A*a. Physical lowering generates four
+25-element slices of A, the matching 25 x 8 slices of a, four products of shape
+8, and an additive reduction of those products. B is an unsplit logical vector
+of length 8. No explicit >+[]> is required. The same pass feeds Chakra and
+ONNX through the shared operation graph. Placement determines the ranks:
+remote products are sent to the reduction rank, with dependencies preserving
+the reduction order. This is a gather-to-one reduction, not an all-reduce.
+Initial inputs and weights are assumed available at their assigned processors;
+this does not model an initial scatter from a host or root rank.
+
+The option setep FILE.setep --python --partitioned emits executable Python
+from that same physical IR for numerical validation. Normal source generation
+remains behavioral. Split-count validation and explicit-array execution retain
+their existing behavior. Operation byte counts use declared storage widths;
+behavioral numerical tests do not emulate FP8 quantization.
+
+Chakra placement (setep --chakra) uses memory-aware next-fit packing over the
+processor inventory: operations are visited in order and, once the next one
+does not fit in the remaining capacity, placement advances to a new processor
+without backfilling earlier ones. Each replica occupies its own processors.
+Weights are stored once per processor; activations, inputs and caches are
+stored once per sequence. Only occupied processors become Chakra ranks, and
+each producer output is sent at most once to each remote destination.
+
+Partitioned training updates:
+Explicit backward formulas use the same partition rules as forward arithmetic.
+For example, A^*D reduces partial weight gradients over a split batch axis;
+adding gradients from multiple microbatches or tied uses accumulates matching
+tiles. Accumulation is a sum; averaging and learning-rate scaling must be
+written explicitly. An update such as w-G >> w must match the declared weight
+dimensions and partition counts. Conflicting layouts are rejected.
+
+Behavioral Python updates the existing Parameter in place after evaluating the
+complete update expression. Physical lowering emits one WEIGHT_UPDATE operation
+per weight tile, retaining its local shape and byte count. All update tiles
+wait for the complete update expression and preceding computations, preserving
+reads of the old weight version. Later operations wait for all writes,
+and subsequent weight reads refer to the updated version. These conservative
+barriers favor correctness over update/computation overlap. Chakra traces
+contain the same update operations and dependencies.
+
+This supports explicit backward arithmetic, including accumulation and SGD;
+it does not synthesize backward formulas for opaque GRADIENT calls. Partitioned
+custom functions, persistent gradient buffers, and control flow still require
+their own lowering support. Accumulation across separate behavioral invocations
+must be managed explicitly; it is not implied by a weight partition declaration.
+
+
+4. Built-in reductions and normalization
+
+These built-ins require no declaration. A user definition with the same name
+continues to take precedence; arbitrary opaque operations are never assigned
+these contracts just because their names resemble a known function.
+
+SUM_LAST()          Sum along the last axis; keep that dimension with size 1.
+MEAN_LAST()         Mean along the last axis; keep that dimension with size 1.
+MAX_LAST()          Maximum along the last axis; keep dimension size 1.
+SOFTMAX_LAST()      Plain, unmasked last-axis Softmax; no attention scaling.
+LAYERNORM_LAST()    Last-axis LayerNorm, population variance, epsilon 1e-5,
+                    without learned gain or bias.
+RMSNORM_LAST()      Divide by sqrt(mean(square(X)) + 1e-5) along the last axis,
+                    without learned gain.
+MUL_ELEMENTS()     Two tensor inputs; elementwise multiplication and broadcasting.
+DIV_ELEMENTS()     Two tensor inputs; elementwise division and broadcasting.
+
+These floating-point contracts apply equally to ordinary behavioral generation
+and partitioned validation. MAX_LAST chooses the first maximum along the
+logical last axis for gradients when values tie. Reductions retain the row
+partition grid and remove the last-axis partitioning. Other axes can be reduced
+by transposing before and after a last-axis reduction.
+
+A = 6[2]%8[4]@fp32
+RUN(A) {A >> MEAN_LAST() >> M; A-M >> CENTERED;
+       CENTERED >> SOFTMAX_LAST() >> B}
+
+M has logical shape 6 x 1 and grid 2 x 1. B has logical shape 6 x 8 and grid
+2 x 4. Physical Softmax first combines local maxima, subtracts the global
+maximum, exponentiates local tiles, combines local sums, and divides each tile
+by the global sum. LayerNorm combines sums for the mean, then centered squared
+sums for the population variance. RMSNorm combines squared sums. Statistics
+have singleton last dimensions; dependencies distribute them to the tiles that
+consume them. Independent local normalization across a split normalization
+axis is not substituted for a global normalization.
+
+Existing SOFTMAX(), LN(), and RMSNORM() declarations remain custom operations.
+Their masking, scaling, learned weights, and model-specific epsilon values are
+not inferred from their names. They still require a separate partition contract
+before being used with shape-partitioned tensors.
+
+
+
+COMMENTS
+
+// introduces a comment extending to the end of the line, in every position.
+
+
+CORE SYMBOLS
+
+Statements within computation bodies and brace scopes are separated by ;.
+Commas are not accepted as statement separators. Empty computations remain ().
+
+=       Named computation definition
+()      Computation definition and reference
+{}      Scope
+/       Forward scope iteration direction
+\       Reverse scope iteration direction
+[n]     Array count after a name; split count after a shape dimension
+[]      Current array element after a name; array results after a scope count
+//      Line comment
+
+:       Group separator
+;       Sequential statement separator
+|       Choice separator
+?       Introduces a choice computation
+*       Multiplication
++       Addition
+-       Subtraction
+^       Transpose
+!       Persistent tensor suffix (not used on weights)
+'       Gradient suffix
+%       Shape dimension separator
+@       Shape datatype prefix
+
+>>      Structure-preserving transfer
+>[n]>    Split each source tensor along its last dimension into n array elements
+>[]>     Array concatenation
+>:>     Group concatenation along the last tensor dimension
+>+[]>    Additive array reduction
+
+ABSTRACT COMPUTATION COSTS
+
+An empty computation body declares an external implementation with default costs:
+    RMSNORM(A) {}
+A body containing cost parameters also declares an external implementation:
+    RMSNORM(A) {
+        ops_per_element = 5;
+        input_reads = 1;
+        output_writes = 1;
+        weight_percent = 100;
+        overhead_ns = 0
+    }
+Any subset is allowed, for example RMSNORM(A) {ops_per_element = 5}.
+These are cost estimates, not executable statements or measured timings.
+The example value 5 is an uncalibrated arithmetic approximation.
+
+Defaults (also used by an empty body):
+    ops_per_element       Standard operation formula below; otherwise 1.
+    input_reads = 1       Full reads of activation inputs, excluding weights.
+    output_writes = 1     Full local-memory writes of the output payload.
+    weight_percent = 100  Percent of input weight bytes read per invocation.
+    overhead_ns = 0       Additional fixed execution overhead in nanoseconds.
+
+Input groups are traversed member by member. Weights passed through tensor
+parameters retain their weight identity and are excluded from activation counts.
+No activation inputs means zero arithmetic under this simple cost model.
+Values are nonnegative integer literals or defined global scalars. weight_percent
+must be at most 100; other values must be at most 1000000000000. Values of zero
+are valid. No floats, new prefix marker, or parser production are required.
+
+The presence of any cost field marks the declaration as abstract. Its body must
+contain only recognized cost-field assignments. Duplicates, unknown fields in
+such a body, shaped/typed values, undefined scalars, and executable statements
+mixed with cost fields are errors. Cost names are reserved inside computations
+and cannot be used as local variables in executable scopes. A nonempty body
+without cost fields remains an implemented computation and derives costs from
+its implementation.
+
+With an explicit ops_per_element, estimated arithmetic = activation input
+elements * ops_per_element, including explicit zero. Memory-only annotations
+do not replace the standard arithmetic default. For N primary-input elements
+and R last-axis rows, standard defaults agree with the generic ONNX lowering:
+    LN / LAYERNORM        5*N + 2*R (non-affine normalization).
+    RMSNORM              3*N + 2*R (non-affine normalization).
+    SOFTMAX              5*N (shared analytical convention).
+    GELU                 9*N (tanh approximation).
+    SILU                 2*N (sigmoid then multiplication).
+    RELU/SIGMOID/TANH     N.
+    LOOKUP               0 (memory traffic is still charged).
+    SAMPLE               V-1 comparisons per batch item, last-position greedy
+                         argmax over vocabulary V; override for other sampling.
+Concrete normalization tensor operations use the same formulas. Last-axis sum
+and max count N-R, mean counts N, and rsqrt_eps counts 3*N. A transcendental
+operation counts as one scalar operation, not one clock cycle. These formulas
+exclude implicit affine weights, attention scaling/masking and custom hook work;
+declare that work explicitly or provide a cost override. They do not imply
+kernel fusion or equivalent execution time across graph representations.
+
+Read bytes = activation input bytes * input_reads + weight bytes * weight_percent/100.
+Write bytes = output payload bytes * output_writes. Resident memory still contains
+all weights, regardless of weight_percent. Transfers still carry the actual
+output payload, regardless of output_writes. overhead_ns is execution overhead,
+not communication latency.
+
+Chakra compute nodes use these costs. A node's effort in cycles is
+arithmetic / gflop-per-cycle + (read MB + write MB) / mb-per-cycle +
+overhead_ns * clock-hz / 1e9 + 1; its duration is that effort in whole
+microseconds at --clock-hz, at least 1. num_ops and tensor_size carry the
+arithmetic and the read bytes. Behavioral Python and its external hooks are
+unchanged.
+
+These defaults replace the former opaque-operation output-element arithmetic
+proxy and include output writes in the effort. They are deliberately simple.
+A static weight_percent cannot represent token-dependent embedding row access,
+cache effects, routing skew, or other shape-dependent behavior accurately.
+
+Model annotations use uncalibrated scalar-operation estimates: SIGMOID 4,
+SILU 5, tanh-approximate GELU 9, non-affine layer normalization 6, and RoPE 3
+per activation input element. Transcendentals and division each count as one
+operation; these counts do not model their hardware latency. RoPE assumes
+precomputed sine/cosine values and does not count table reads.
+Split/expand declarations assume materialized copies with zero arithmetic and
+default input reads/output writes. View implementations can avoid those accesses.
+Dispatch/scatter estimates cover payload copying, omitting index processing,
+selection and zero-fill costs. They do not suppress network transfers.
+Declarations labeled default cost placeholders still use the generic defaults;
+they are not calibrated estimates. Embeddings, compound attention/vision/delta
+operations, routing and backward computations need more detailed cost models
+or measured timings before their timing estimates can be relied upon.
+
+GRAMMAR
+
+Here are the target SETEP grammar rules. Some grammatical forms are not
+semantically allowed. In particular, scope repetition requires a count or [],
+and transfers are restricted to >>, >:>, >[]>, >[n]>, and >+[]>; n is a card.
+The indexed selector prefix ?SELECT[]() replaces the historical # selector suffix.
+REPEAT and CHOOSE are reserved scope names that leave the scope unnamed.
+A selector cannot be combined with a repetition count on the same scope.
+Computation definitions require parentheses, although the grammar makes them
+optional: an abstract NAME() {} takes no input.
+"=" shape is a definition: it may only follow a single value name, optionally
+with [n], and nothing may follow the shape. Top-level statements must be
+definitions.
+
+card : number | lowerName ;
+
+name : upperName | lowerName ;
+
+valueName : name [ "[" [card] "]" ] ;
+
+value : valueName [ "(" ")" ] ["^"] ;
+
+shapeDim : card>dim [ "[" card>split "]" ] ;
+
+shape : shapeDim { "%" shapeDim } ["@" lowerName] ;
+
+group : value { ":" value } ;
+
+transferOp : ">" ["+"] [ ":" | "[" [card] "]" ] ">" ;
+
+scopeOp : "+" | "-" | "*" ;
+
+scopeArg : scope | group ;
+
+scopeExpr : [scopeOp>first] scopeArg {scopeOp  scopeArg} ;
+
+scopeSep : "|" | transferOp;
+
+scopeStmt : scopeExpr ["=" shape] { scopeSep scopeExpr } ;
+
+scopeBody : scopeStmt {";" scopeStmt} ;
+
+repDirection : "/" | "\\" ;
+
+repType : [card] ["[" "]"] ;
+
+repetition : repDirection repType ;
+
+choice : "?" upperName>choiceComp ["[" "]"] "(" ")" ;
+
+scopeName : upperName>scopeName [repetition] [choice] ;
+
+scope : [scopeName] "{" scopeBody "}" ;
+
+compDef : upperName ["(" [upperName {":" upperName}] ")"] "{" [scopeBody] "}" ;
+
+setepModel : { compDef | scopeStmt } ;
+
+APPENDIX 1 - SETEP PARALLELISM AND ALGORITHM EXAMPLES
+
+1. DATA PARALLELISM (DP)
+
+INPUTS[3] >> REPEAT/[]{MODEL()} >> OUTPUTS
+
+INPUTS contains three independent tensor inputs; OUTPUTS is an array of three results.
+There are 3 corresponding MODEL scopes, each representing an independent
+model replica. Each replica receives one input and produces one
+corresponding output.
+
+The model weights are not arrayed, so the replicas use the same logical
+model parameters. During training, gradients from the replicas are
+synchronized.
+
+2. TENSOR PARALLELISM (TP)
+
+Shape-defined partition intent:
+
+A = 100[4]%200@fp8
+F(A) {}
+RUN(A) {A >> F() >> B}
+
+Behavioral F receives the full 100 x 200 tensor. Distributed lowering needs
+a partition rule for F; it cannot assume that four independent local calls
+implement an arbitrary F. See SPLIT TENSORS for implementation status.
+
+Transfer-based splitting explicitly uses array execution semantics:
+
+A >[n]> REPEAT/n[]{*a[]} >+[]> B
+
+A is split into n tensor partitions.
+Each partition is processed by a corresponding computation instance.
+a[] denotes the corresponding member of an explicitly declared weight array,
+whose members must have compatible local shapes.
+The n partial results are additively reduced into B.
+
+
+3. PIPELINE PARALLELISM (PP)
+
+A >> P1{L1} >> P2{L2} >> P3{L3} >> B
+
+P1, P2, and P3 are sequential pipeline stages.
+When mapped to different devices, successive inputs or microbatches can
+occupy different stages simultaneously.
+
+Setep specifies the stage dependencies; the scheduler determines overlap.
+
+
+4. CONTEXT / SEQUENCE PARALLELISM (CP)
+
+A >[n]> REPEAT/n[]{ATTENTION()} >[]> B
+
+A is one context tensor split into n portions.
+The same ATTENTION computation is applied to each portion.
+Because ATTENTION is not arrayed, all instances use the same computation
+and logical weights.
+The resulting array is explicitly concatenated back into B.
+
+In this explicit-array example, >[n]> splits the last tensor dimension.
+Implicit partitioning instead specifies the split dimensions in the tensor definition.
+
+
+5. EXPERT PARALLELISM (EP)
+
+ROUTER(A) {}
+DISPATCH(A:ASSIGNMENTS:PROBABILITIES) {}
+SCALE(Y:W) {}
+SCATTER(Y:POSITIONS) {}
+EXPERT(X) {}
+ROUTED_FF(A) {
+    A >> ROUTER() >> ASSIGNMENTS:PROBABILITIES;
+    A:ASSIGNMENTS:PROBABILITIES >> REPEAT/m[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> EXPERT[]() >> Y;
+        Y:W >> SCALE() >> Y;
+        Y:POSITIONS >> SCATTER() >> Z
+    } >+[]> B
+}
+
+ROUTER assigns tokens to m experts and computes routing probabilities.
+DISPATCH receives the expert instance identity and gathers its assigned tokens.
+SCALE applies elementwise routing weights. SCATTER restores original token
+positions in a full-size output, using zeros for unassigned positions.
+All peer outputs have the same shape and are additively reduced into B.
+Empty experts and capacity overflow are handled by the routing computations.
+
+
+6. BATCH PARALLELISM (BP)
+
+BATCH[n] >> REPEAT/[]{MODEL()} >> RESULTS
+
+The n elements of BATCH are independent members of a batch and are processed
+independently.
+
+The Setep structure is similar to DP. The distinction is in mapping:
+batch-parallel instances may be executed as members of one model workload,
+while data-parallel instances represent model replicas distributed across
+devices/ranks.
+
+7. COLLECTIVE COMBINATIONS
+
+PARTIALS >+[]> TOTAL
+
+Add corresponding entries across an array of equal-shaped tensors.
+
+PARTS >[]> WHOLE
+
+Concatenate array partitions into their logical tensor.
+
+A:B:C >:> WHOLE
+
+Concatenate group members along the last dimension. All other dimensions match.
+
+PARTIALS >+[]> TOTAL; TOTAL >[n]> PARTS
+
+Reduce an array, then split the result through an explicit intermediate value.
+These expressions describe value transformations; processor placement and
+communication realization are separate generator responsibilities.
+
+APPENDIX 2 - SIMPLIFIED CHATGPT2 INFERENCE COMPUTATION EXAMPLES
+
+LEGACY EXAMPLES: Appendices 2 onward retain historical pseudocode, including
+single-ended transfers, square-bracket computations, # element references,
+slash-based array declarations, and old repetition forms.
+They are not normative syntax and have not been migrated to the transfer and
+scope rules above. In particular, historical >> may concatenate, whereas the
+current >> never implicitly concatenates. Use the main specification and
+Appendix 1 for current transfer and scope syntax.
+
+CHATGPT2_INFERENCE =
+    TOKEN_IN >
+    [EMBED] >> B >
+
+    BLOCK(
+        B >> [LN] >> C;
+
+        C >> [*q:k:v] >:> Q:K:V >12:
+        ([Q#*K#^;SOFTMAX;*V#]/:12) >
+        [*o] >> D;
+
+        D:B >+ E;
+
+        E >> [LN] >> F;
+        F >> [MLP] >> G;
+
+        G:E >+ H
+    )/12 >
+
+    [LN] >> I;
+    I >> [LMHEAD] >> J;
+    J >> [SAMPLE] >> TOKEN_OUT
+
+APPENDIX 3 - COMPLETE CHATGPT2 INFERENCE AND TRAINING COMPUTATIONS EXAMPLES
+
+// ============================================================
+// CHATGPT2 / GPT-2
+//
+// 12 transformer blocks
+// 12 attention heads
+// Inference: PREFILL followed by repeated DECODE
+// Training: forward, reverse-order backward, then weight updates
+// ============================================================
+
+
+// ------------------------------------------------------------
+// MLP
+// ------------------------------------------------------------
+
+MLP =
+    MLP(
+        A >> X;
+        X >> [*up] >> U;
+        U >> [GELU] >> G;
+        G >> [*down] >> B
+    )
+
+
+MLP' =
+    MLP(
+        B' >
+        [G^*B'] >> down';
+        [B'*down^] >> G';
+        U >> [GELU'] >> D;
+        [G'*D] >> U';
+        [X^*U'] >> up';
+        [U'*up^] >> A'
+    )
+
+
+MLP_UPDATE =
+    MLP(
+        [up-ETA*up'] >> up;
+        [down-ETA*down'] >> down
+    )
+
+
+// ------------------------------------------------------------
+// MULTI-HEAD ATTENTION
+// ------------------------------------------------------------
+
+ATTENTION =
+    ATTENTION(
+        A >> X;
+        X >
+        [*q:k:v] >:> Q:K:V >12:
+        ([Q#*K#^;SOFTMAX;*V#]/:12) >
+        H;
+        H >> [*o] >> B
+    )
+
+
+// ATTENTION' represents the backward computation through:
+//
+//     output projection
+//     merge/split of the 12 heads
+//     V multiplication
+//     SOFTMAX
+//     Q*K^
+//     Q/K/V projections
+//
+// It produces q', k', v', o' and returns A'.
+// The ATTENTION named scope gives it access to forward state.
+
+ATTENTION' =
+    ATTENTION(
+        B' >
+        [ATTENTION_BACKWARD] >> A'
+    )
+
+
+ATTENTION_UPDATE =
+    ATTENTION(
+        [q-ETA*q'] >> q;
+        [k-ETA*k'] >> k;
+        [v-ETA*v'] >> v;
+        [o-ETA*o'] >> o
+    )
+
+
+// ------------------------------------------------------------
+// TRANSFORMER BLOCK
+//
+// GPT-2 uses pre-layer normalization and two residual paths.
+// ------------------------------------------------------------
+
+BLOCK =
+    BLOCK(
+        A >> X;
+
+        X >> [LN1] >> N1;
+        N1 >> [ATTENTION] >> T;
+        T:X >+ B;
+
+        B >> [LN2] >> N2;
+        N2 >> [MLP] >> M;
+        M:B >+ C
+    )
+
+
+// ------------------------------------------------------------
+// BLOCK BACKWARD
+//
+// C' is copied down the MLP path and the second residual path.
+// Their gradients are combined at B'.
+//
+// B' is then copied down the attention path and first residual
+// path. Their gradients are combined at A'.
+// ------------------------------------------------------------
+
+BLOCK' =
+    BLOCK(
+        C' >> M':BR';
+
+        M' >> [MLP'] >> N2';
+        N2' >> [LN2'] >> BL';
+        BR':BL' >+ B';
+
+        B' >> T':AR';
+
+        T' >> [ATTENTION'] >> N1';
+        N1' >> [LN1'] >> AL';
+        AR':AL' >+ A'
+    )
+
+
+BLOCK_UPDATE =
+    BLOCK(
+        [ATTENTION_UPDATE];
+        [MLP_UPDATE];
+        [LN1_UPDATE];
+        [LN2_UPDATE]
+    )
+
+
+// ============================================================
+// INFERENCE
+// ============================================================
+
+
+// ------------------------------------------------------------
+// PREFILL ATTENTION
+//
+// The prompt is processed as a sequence.
+// K and V become persistent cache state in KV.
+// ------------------------------------------------------------
+
+PREFILL_ATTENTION =
+    ATTENTION(
+        A >> X;
+
+        X >
+        [*q:k:v] >:> Q:K:V;
+
+        KV(
+            K >> CK;
+            V >> CV
+        );
+        Q:K:V >12:
+        ([Q#*K#^;SOFTMAX;*V#]/:12) >
+        H;
+
+        H >> [*o] >> B
+    )
+
+
+PREFILL_BLOCK =
+    BLOCK(
+        A >> X;
+
+        X >> [LN1] >> N1;
+        N1 >> [PREFILL_ATTENTION] >> T;
+        T:X >+ B;
+
+        B >> [LN2] >> N2;
+        N2 >> [MLP] >> M;
+        M:B >+ C
+    )
+
+
+PREFILL =
+    A >
+    [EMBED] >
+    ([PREFILL_BLOCK#])/12 >
+    [LN] >
+    [LMHEAD] >
+    [SAMPLE] >
+    B
+
+
+// ------------------------------------------------------------
+// DECODE ATTENTION
+//
+// One new K and V are produced for the new token.
+// CK:K >> CK and CV:V >> CV append by group merge.
+// ------------------------------------------------------------
+
+DECODE_ATTENTION =
+    ATTENTION(
+        A >> X;
+
+        X >
+        [*q:k:v] >:> Q:K:V;
+
+        KV(
+            CK:K >> CK;
+            CV:V >> CV
+        );
+        Q:CK:CV >12:
+        ([Q#*CK#^;SOFTMAX;*CV#]/:12) >
+        H;
+
+        H >> [*o] >> B
+    )
+
+
+DECODE_BLOCK =
+    BLOCK(
+        A >> X;
+
+        X >> [LN1] >> N1;
+        N1 >> [DECODE_ATTENTION] >> T;
+        T:X >+ B;
+
+        B >> [LN2] >> N2;
+        N2 >> [MLP] >> M;
+        M:B >+ C
+    )
+
+
+DECODE =
+    A >
+    [EMBED] >
+    ([DECODE_BLOCK#])/12 >
+    [LN] >
+    [LMHEAD] >
+    [SAMPLE] >
+    B
+
+
+CHATGPT2_INFERENCE =
+    A >> [PREFILL] >> B;
+    ([DECODE])/n
+
+
+// ============================================================
+// TRAINING
+// ============================================================
+
+
+// ------------------------------------------------------------
+// TRAINING FORWARD
+//
+// Uses ordinary full-sequence attention.
+// The named BLOCK, ATTENTION and MLP scopes retain the forward
+// tensors required by their corresponding backward computations.
+// ------------------------------------------------------------
+
+TRAIN_FORWARD =
+    TRAIN(
+        A >> [EMBED] >> E;
+        E >> ([BLOCK#])/12 >> H;
+        H >> [LN] >> N;
+        N >> [LMHEAD] >> LOGITS;
+        LOGITS >> [LOSS] >> L
+    )
+
+
+// ------------------------------------------------------------
+// TRAINING BACKWARD
+//
+// [L'] generates the initial scalar loss gradient.
+//
+// \12 traverses:
+//     BLOCK11', BLOCK10', ... BLOCK0'
+//
+// Each backward block accesses state saved by its corresponding
+// forward block and produces weight gradients as side results.
+// ------------------------------------------------------------
+
+TRAIN_BACKWARD =
+    TRAIN(
+        [L'] >> [LOSS'] >> LOGITS';
+        LOGITS' >> [LMHEAD'] >> N';
+        N' >> [LN'] >> H';
+        H' >> ([BLOCK'#])\12 >> E';
+        E' >> [EMBED'] >> A'
+    )
+
+
+// ------------------------------------------------------------
+// WEIGHT UPDATE
+//
+// Each BLOCK_UPDATE# operates on the weights and gradients
+// belonging to its corresponding transformer block.
+// ETA is the learning-rate value.
+// ------------------------------------------------------------
+
+MODEL_UPDATE =
+    TRAIN(
+        [EMBED_UPDATE];
+        ([BLOCK_UPDATE#])/12;
+        [LN_UPDATE];
+        [LMHEAD_UPDATE]
+    )
+
+
+// ------------------------------------------------------------
+// COMPLETE TRAINING STEP
+//
+// Comma-separated statements execute sequentially.
+// TRAIN_BACKWARD requires no explicit result from TRAIN_FORWARD;
+// it uses the state saved during the forward computations.
+// ------------------------------------------------------------
+
+CHATGPT2_TRAIN =
+    A >> [TRAIN_FORWARD] >> L;
+    [TRAIN_BACKWARD];
+    [MODEL_UPDATE]
+
+APPENDIX 4: KIMI K2 INFERENCE AND TRAINING EXAMPLES
+
+// ============================================================
+// KIMI K2 INFERENCE AND TRAINING
+//
+// 61 transformer layers:
+//     1 dense layer
+//     60 MoE layers
+//
+// 64 attention heads
+// 384 routed experts
+// 8 experts selected per token
+// 1 shared expert
+// MLA attention
+// SwiGLU experts
+// ============================================================
+
+
+// ------------------------------------------------------------
+// SWIGLU
+// ------------------------------------------------------------
+
+SWIGLU =
+    A >
+    [*gate:*up] >:> G:U;
+
+    G >> [SILU] >> S;
+    [S*U] >> T;
+    T >> [*down] >> B
+
+
+// ------------------------------------------------------------
+// DENSE MLP
+// ------------------------------------------------------------
+
+DENSE_MLP =
+    [SWIGLU]
+
+
+// ------------------------------------------------------------
+// EXPERT
+//
+// Each expert has the same computation structure.
+// gate#, up#, and down# vary with the expert instance.
+// ------------------------------------------------------------
+
+EXPERT =
+    A >
+    [*gate#:*up#] >:> G:U;
+
+    G >> [SILU] >> S;
+    [S*U] >> T;
+    T >> [*down#] >> B
+
+
+// ------------------------------------------------------------
+// MOE
+//
+// ROUTER generates selector S and routing weights e#.
+// S determines which of the 384 routed expert instances execute.
+// The selected routed outputs are weighted and reduced.
+//
+// SHARED_EXPERT always executes.
+// ------------------------------------------------------------
+
+MOE =
+    ROUTE(
+        A >> [ROUTER] >> S;
+
+        A >> {DISPATCH#() >> EXPERT#() >> SCALE#() >> SCATTER#()}/:384 >+ R;
+        A >> [EXPERT] >> H;
+
+        R:H >+ B
+    )
+
+
+// ------------------------------------------------------------
+// MLA ATTENTION -- INFERENCE PREFILL
+//
+// C is the compressed latent KV representation retained by MLA_STATE.
+// Q is split into 64 heads.
+// This is intentionally architectural rather than a complete expansion
+// of every RoPE/non-RoPE projection in MLA.
+// ------------------------------------------------------------
+
+MLA_PREFILL =
+    MLA_STATE(
+        A >> [*q] >> Q;
+        A >> [*kv] >> C;
+        C >> CC
+    );
+    Q:C >64:
+    ([MLA_HEAD]/:64) >
+    [*o;+A] >> B
+
+
+// ------------------------------------------------------------
+// MLA ATTENTION -- DECODE
+//
+// A new compressed latent C is produced for the current token
+// and appended to the persistent compressed cache CC.
+// ------------------------------------------------------------
+
+MLA_DECODE =
+    MLA_STATE(
+        A >> [*q] >> Q;
+        A >> [*kv] >> C;
+        CC:C >> CC
+    );
+    Q:CC >64:
+    ([MLA_HEAD]/:64) >
+    [*o;+A] >> B
+
+
+// ------------------------------------------------------------
+// DENSE TRANSFORMER LAYER
+// ------------------------------------------------------------
+
+DENSE_LAYER =
+    A >> [RMSNORM] >> N1;
+    N1 >> [MLA_PREFILL] >> T;
+    T:A >+ B;
+
+    B >> [RMSNORM] >> N2;
+    N2 >> [DENSE_MLP] >> M;
+    M:B >+ C
+
+
+// ------------------------------------------------------------
+// MOE TRANSFORMER LAYER
+// ------------------------------------------------------------
+
+MOE_LAYER =
+    A >> [RMSNORM] >> N1;
+    N1 >> [MLA_PREFILL] >> T;
+    T:A >+ B;
+
+    B >> [RMSNORM] >> N2;
+    N2 >> [MOE] >> M;
+    M:B >+ C
+
+
+// ============================================================
+// INFERENCE
+// ============================================================
+
+
+// ------------------------------------------------------------
+// PREFILL
+//
+// The first layer is dense.
+// The remaining 60 layers are MoE layers.
+// ------------------------------------------------------------
+
+KIMI_PREFILL =
+    TOKEN_GROUP >
+    [EMBED] >
+
+    [DENSE_LAYER] >
+
+    ([MOE_LAYER#])/60 >
+
+    [RMSNORM] >
+    [LMHEAD] >
+    [SAMPLE] >
+    TOKEN_OUT
+
+
+// ------------------------------------------------------------
+// DECODE VERSIONS OF THE LAYERS
+// ------------------------------------------------------------
+
+DENSE_DECODE_LAYER =
+    A >> [RMSNORM] >> N1;
+    N1 >> [MLA_DECODE] >> T;
+    T:A >+ B;
+
+    B >> [RMSNORM] >> N2;
+    N2 >> [DENSE_MLP] >> M;
+    M:B >+ C
+
+
+MOE_DECODE_LAYER =
+    A >> [RMSNORM] >> N1;
+    N1 >> [MLA_DECODE] >> T;
+    T:A >+ B;
+
+    B >> [RMSNORM] >> N2;
+    N2 >> [MOE] >> M;
+    M:B >+ C
+
+
+KIMI_DECODE =
+    TOKEN_IN >
+    [EMBED] >
+
+    [DENSE_DECODE_LAYER] >
+
+    ([MOE_DECODE_LAYER#])/60 >
+
+    [RMSNORM] >
+    [LMHEAD] >
+    [SAMPLE] >
+    TOKEN_OUT
+
+
+KIMI_INFERENCE =
+    TOKEN_GROUP >> [KIMI_PREFILL] >> TOKEN_OUT;
+    ([KIMI_DECODE])/n
+
+
+// ============================================================
+// TRAINING FORWARD
+//
+// Training does not require the inference KV cache.
+// Use an MLA computation that retains only the forward
+// intermediates required by MLA'.
+// ============================================================
+
+MLA =
+    MLA(
+        A >> [*q] >> Q;
+        A >> [*kv] >> C;
+
+        Q:C >64:
+        ([MLA_HEAD]/:64) >
+        H;
+
+        H >> [*o;+A] >> B
+    )
+
+
+TRAIN_DENSE_LAYER =
+    LAYER(
+        A >> [RMSNORM] >> N1;
+        N1 >> [MLA] >> T;
+        T:A >+ B;
+
+        B >> [RMSNORM] >> N2;
+        N2 >> [DENSE_MLP] >> M;
+        M:B >+ C
+    )
+
+
+TRAIN_MOE_LAYER =
+    LAYER(
+        A >> [RMSNORM] >> N1;
+        N1 >> [MLA] >> T;
+        T:A >+ B;
+
+        B >> [RMSNORM] >> N2;
+        N2 >> [MOE] >> M;
+        M:B >+ C
+    )
+
+
+KIMI_TRAIN_FORWARD =
+    TRAIN(
+        TOKEN_GROUP >
+        [EMBED] >
+
+        [TRAIN_DENSE_LAYER] >
+
+        ([TRAIN_MOE_LAYER#])/60 >
+
+        [RMSNORM] >
+        [LMHEAD] >
+        LOGITS;
+
+        LOGITS >> [LOSS] >> L
+    )
+
+
+// ============================================================
+// BACKWARD COMPUTATIONS
+// ============================================================
+
+
+// ------------------------------------------------------------
+// SWIGLU BACKWARD
+// ------------------------------------------------------------
+
+SWIGLU' =
+    SWIGLU(
+        B' >
+        [T^*B'] >> down';
+        [B'*down^] >> T';
+
+        S:U:T' >> [MUL'] >:> S':U';
+
+        G >> [SILU'] >> D;
+        [S'*D] >> G';
+
+        [A^*G'] >> gate';
+        [A^*U'] >> up';
+
+        [G'*gate^] >> A1';
+        [U'*up^] >> A2';
+
+        A1':A2' >+ A'
+    )
+
+
+// ------------------------------------------------------------
+// EXPERT BACKWARD
+//
+// Same expert instance index is used for its forward and backward
+// weights because gate#, up#, and down# are instance indexed.
+// ------------------------------------------------------------
+
+EXPERT' =
+    EXPERT(
+        B' >
+        [T^*B'] >> down'#;
+        [B'*down#^] >> T';
+
+        S:U:T' >> [MUL'] >:> S':U';
+
+        G >> [SILU'] >> D;
+        [S'*D] >> G';
+
+        [A^*G'] >> gate'#;
+        [A^*U'] >> up'#;
+
+        [G'*gate#^] >> A1';
+        [U'*up#^] >> A2';
+
+        A1':A2' >+ A'
+    )
+
+
+// ------------------------------------------------------------
+// MOE BACKWARD
+//
+// ROUTE uses selector S saved by the forward MOE.
+// Exactly the experts selected during forward are traversed backward.
+// ------------------------------------------------------------
+
+MOE' =
+    ROUTE(
+        B' >> {DISPATCH_BACK#() >> EXPERT'#() >> SCATTER_BACK#()}/:384 >+ A_ROUTED';
+        B' >> [EXPERT'] >> A_SHARED';
+
+        A_ROUTED':A_SHARED' >+ A'
+    )
+
+
+// ------------------------------------------------------------
+// MLA BACKWARD
+//
+// Kept abstract here because MLA decomposes Q/K information into
+// compressed latent and positional/non-positional components.
+// It produces q', kv', o' and activation gradient A'.
+// ------------------------------------------------------------
+
+MLA' =
+    MLA(
+        B' >> [MLA_BACKWARD] >> A'
+    )
+
+
+// ------------------------------------------------------------
+// DENSE LAYER BACKWARD
+// ------------------------------------------------------------
+
+TRAIN_DENSE_LAYER' =
+    LAYER(
+        C' >> M':BR2';
+
+        M' >> [DENSE_MLP'] >> N2';
+        N2' >> [RMSNORM'] >> BL2';
+        BR2':BL2' >+ B';
+
+        B' >> T':BR1';
+
+        T' >> [MLA'] >> N1';
+        N1' >> [RMSNORM'] >> BL1';
+        BR1':BL1' >+ A'
+    )
+
+
+// ------------------------------------------------------------
+// MOE LAYER BACKWARD
+// ------------------------------------------------------------
+
+TRAIN_MOE_LAYER' =
+    LAYER(
+        C' >> M':BR2';
+
+        M' >> [MOE'] >> N2';
+        N2' >> [RMSNORM'] >> BL2';
+        BR2':BL2' >+ B';
+
+        B' >> T':BR1';
+
+        T' >> [MLA'] >> N1';
+        N1' >> [RMSNORM'] >> BL1';
+        BR1':BL1' >+ A'
+    )
+
+
+// ------------------------------------------------------------
+// COMPLETE BACKWARD
+//
+// The 60 MoE layers are traversed in reverse order first,
+// followed by the initial dense layer.
+// ------------------------------------------------------------
+
+KIMI_TRAIN_BACKWARD =
+    TRAIN(
+        [L'] >> [LOSS'] >> LOGITS';
+        LOGITS' >> [LMHEAD'] >> N';
+        N' >> [RMSNORM'] >> H';
+
+        H' >> ([TRAIN_MOE_LAYER'#])\60 >> D';
+        D' >> [TRAIN_DENSE_LAYER'] >> E';
+
+        E' >> [EMBED'] >> TOKEN_GROUP'
+    )
+
+
+// ============================================================
+// WEIGHT UPDATE
+//
+// Shown schematically. Every learned parameter and its gradient
+// participate in the optimizer.
+//
+// Kimi K2 actually uses Muon/MuonClip during pretraining;
+// SGD is shown here only to make the Setep update dataflow simple.
+// ============================================================
+
+EXPERT_UPDATE =
+    EXPERT(
+        [gate#-ETA*gate'#] >> gate#;
+        [up#-ETA*up'#] >> up#;
+        [down#-ETA*down'#] >> down#
+    )
+
+
+MOE_UPDATE =
+    ROUTE(
+        {EXPERT_UPDATE#()}/:384;
+        [ROUTER_UPDATE]
+    )
+
+
+MLA_UPDATE =
+    MLA(
+        [q-ETA*q'] >> q;
+        [kv-ETA*kv'] >> kv;
+        [o-ETA*o'] >> o
+    )
+
+
+DENSE_LAYER_UPDATE =
+    LAYER(
+        [MLA_UPDATE];
+        [DENSE_MLP_UPDATE];
+        [RMSNORM_UPDATE]
+    )
+
+
+MOE_LAYER_UPDATE =
+    LAYER(
+        [MLA_UPDATE];
+        [MOE_UPDATE];
+        [RMSNORM_UPDATE]
+    )
+
+
+KIMI_MODEL_UPDATE =
+    TRAIN(
+        [EMBED_UPDATE];
+        [DENSE_LAYER_UPDATE];
+        ([MOE_LAYER_UPDATE#])/60;
+        [RMSNORM_UPDATE];
+        [LMHEAD_UPDATE]
+    )
+
+
+// ============================================================
+// COMPLETE TRAINING STEP
+// ============================================================
+
+KIMI_TRAIN =
+    TOKEN_GROUP >> [KIMI_TRAIN_FORWARD] >> L;
+    [KIMI_TRAIN_BACKWARD];
+    [KIMI_MODEL_UPDATE]
+
+
+
+// ============================================================
+// DEEPSEEK R1 INFERENCE
+// ============================================================
+
+layers = 61
+denseLayers = 3
+moeLayers = 58
+experts = 256
+activeExperts = 8
+modelWidth = 7168
+expertWidth = 2048
+
+
+EXPERT = ( A >> [*up# >> SILU >> *down#] >> B )
+
+
+MOE = (
+    A >> [ROUTER] >> S;
+    A >> ([EXPERT*e#]|/experts)|S +> R;
+    A >> [SHARED_EXPERT] >> H;
+    [R+H] >> B
+)
+
+DENSE_LAYER = (
+    A >> [RMSNORM] >> [MLA] >> D;
+    [D+A] >> E >> [RMSNORM] >> [MLP] >> F;
+    [F+E] >> B
+)
+
+MOE_LAYER = (
+    A >> [RMSNORM] >> [MLA] >> D;
+    [D+A] >> E >> [RMSNORM] >> [MOE] >> F;
+    [F+E] >> B
+)
+
+DEEPSEEK_R1 = (
+    TOKEN_IN >> [EMBED] >
+    ([DENSE_LAYER#])/denseLayers >
+    ([MOE_LAYER#])/moeLayers >
+    [RMSNORM] >> [LMHEAD] >> [SAMPLE] >> TOKEN_OUT
+)

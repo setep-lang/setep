@@ -1,0 +1,532 @@
+// SWITCH BASE-8: FULL ENCODER-DECODER TRAINING, ONE SGD STEP.
+// Tokenized, single-sequence inputs. TARGETS are output token IDs, not expert
+// labels; -100 excludes a target from cross entropy. SHIFT_RIGHT inserts the
+// decoder start token and replaces shifted -100 values with the padding token.
+// All 12 encoder and 12 decoder layers are trainable, including eight experts
+// in each sparse layer, routers, RMSNorm scales and relative-position biases.
+// No inference KV cache: decoder attention sees the complete teacher-forced
+// target sequence. Encoder and decoder embeddings and the LM head share wte.
+// Opaque primitive contracts and runnable PyTorch implementation are documented
+// in switch_base_8_training_impl.py. Generated placeholders alone do not train.
+// GRADIENT returns d(LOSS)/d(PARAMETER). All gradients are materialized before
+// any UPDATE, including contributions through decoder cross-attention and all
+// three uses of the tied embedding. SCALE_GRADIENT applies optional global-norm
+// clipping and the configured SGD learning rate (default 0.001). Empty[unused]
+// experts receive zero gradients. The CLI clips to global norm 1 by default.
+// Router losses aggregate sparse-layer logits separately for encoder[decoder],
+// matching transformers 4.57.6; coefficients, dropout, jitter, capacity and
+// sparse-layer placement come from the checkpoint configuration.
+
+tokens = 32
+target_tokens = 32
+encoder_layers = 12
+decoder_layers = 12
+heads = 12
+experts = 8
+model_width = 768
+ff_width = 3072
+head_width = 64
+vocab_size = 32128
+relative_buckets = 32
+
+TOKEN_IN = tokens@int32
+ATTENTION_MASK = tokens@int32
+TARGETS = target_tokens@int32
+DECODER_MASK = target_tokens@int32
+LOSS = 1@fp32
+wte = vocab_size%model_width@fp32
+enc_relative_bias = relative_buckets%heads@fp32
+dec_relative_bias = relative_buckets%heads@fp32
+enc_final_scale = 1%model_width@fp32
+dec_final_scale = 1%model_width@fp32
+enc_q[encoder_layers] = model_width%model_width@fp32
+enc_k[encoder_layers] = model_width%model_width@fp32
+enc_v[encoder_layers] = model_width%model_width@fp32
+enc_o[encoder_layers] = model_width%model_width@fp32
+enc_ln1[encoder_layers] = 1%model_width@fp32
+enc_ln2[encoder_layers] = 1%model_width@fp32
+enc_wi[encoder_layers] = model_width%ff_width@fp32
+enc_wo[encoder_layers] = ff_width%model_width@fp32
+enc_router[encoder_layers] = model_width%experts@fp32
+enc_expert_wi[experts] = model_width%ff_width@fp32
+enc_expert_wo[experts] = ff_width%model_width@fp32
+dec_q[decoder_layers] = model_width%model_width@fp32
+dec_k[decoder_layers] = model_width%model_width@fp32
+dec_v[decoder_layers] = model_width%model_width@fp32
+dec_o[decoder_layers] = model_width%model_width@fp32
+dec_ln1[decoder_layers] = 1%model_width@fp32
+dec_ln2[decoder_layers] = 1%model_width@fp32
+dec_ln3[decoder_layers] = 1%model_width@fp32
+dec_wi[decoder_layers] = model_width%ff_width@fp32
+dec_wo[decoder_layers] = ff_width%model_width@fp32
+dec_router[decoder_layers] = model_width%experts@fp32
+dec_expert_wi[experts] = model_width%ff_width@fp32
+dec_expert_wo[experts] = ff_width%model_width@fp32
+cross_q[decoder_layers] = model_width%model_width@fp32
+cross_k[decoder_layers] = model_width%model_width@fp32
+cross_v[decoder_layers] = model_width%model_width@fp32
+cross_o[decoder_layers] = model_width%model_width@fp32
+
+// Primitive contracts: RMSNORM(value, scale), LOOKUP(ids, shared_table),
+// BIAS(scores, table, head index), SOFTMAX(scores, mask), and elementwise SCALE.
+// DROPOUT and ROUTER_JITTER use training-mode randomness. Attention scores are
+// unscaled (T5 convention); HEAD_SCALE applies model_width**-0.5 at the LM head.
+// ROUTE applies top-1 routing and per-sequence capacity; overflow IDs are -1.
+// DISPATCH gathers rows for one expert, SCATTER restores their token positions.
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+LOOKUP(IDS:TABLE) {}
+SHIFT_RIGHT(TARGETS) {}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RMSNORM(X:A) {ops_per_element = 5}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+SOFTMAX(BIASED:MASK) {ops_per_element = 5}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RELU(A) {ops_per_element = 1}
+DROPOUT(A) {}
+ROUTER_JITTER(A) {}
+ENCODER_BIAS(SCORES:PARAMETER) {}
+DECODER_BIAS(SCORES:PARAMETER) {}
+CAUSAL_MASK(DECODER_MASK) {}
+HEAD_SCALE(A) {}
+// Default cost placeholder: routing selection costs depend on expert count and selection algorithm.
+ROUTE(LOGITS) {}
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+DISPATCH(A:B:C) {ops_per_element = 0}
+SCALE(Y:W) {}
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+SCATTER(Y:POSITIONS:A) {ops_per_element = 0}
+ZERO_ROUTER_LOGITS(A) {}
+// Concatenated FF output[router] logits keep selector alternatives homogeneous.
+UNPACK_FF(A) {}
+SELECT_ENCODER_FF(A) {}
+SELECT_DECODER_FF(A) {}
+ENCODER_ROUTER_LOSS(PACKED) {}
+DECODER_ROUTER_LOSS(PACKED) {}
+CROSS_ENTROPY(LOGITS:TARGETS) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+GRADIENT(LOSS:A) {}
+SCALE_GRADIENT(D_ENC_Q) {}
+REPORT_LOSS(A) {}
+
+EMBED(IDS) {wte >> TABLE; IDS:TABLE >> LOOKUP() >> DROPOUT() >> X}
+
+ENCODER_ATTENTION(A:MASK) {
+    A >> *enc_q:enc_k:enc_v >[heads]> Q:K:V;
+    REPEAT/heads[]{
+        Q[]*K[]^ >> SCORES;
+        enc_relative_bias >> PARAMETER;
+        SCORES:PARAMETER >> ENCODER_BIAS[]() >> BIAS;
+        SCORES+BIAS >> BIASED;
+        BIASED:MASK >> SOFTMAX() >> DROPOUT() >> PROBS;
+        PROBS*V[]
+    } >[]> *enc_o >> DROPOUT() >> B
+}
+ENCODER_DENSE_FF(A) {
+    A >> *enc_wi >> RELU() >> DROPOUT() >> *enc_wo >> B;
+    A >> ZERO_ROUTER_LOGITS() >> LOGITS;
+    B:LOGITS >:> PACKED
+}
+ENCODER_EXPERT(A) {A >> *enc_expert_wi >> RELU() >> DROPOUT() >> *enc_expert_wo >> B}
+ENCODER_SWITCH_FF(A) {
+    A >> ROUTER_JITTER() >> *enc_router >> LOGITS;
+    LOGITS >> ROUTE() >> EXPERT_ID:WEIGHT;
+    A:EXPERT_ID:WEIGHT >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> ENCODER_EXPERT[]() >> Y;
+        Y:W >> SCALE() >> Y;
+        Y:POSITIONS:A >> SCATTER() >> Z
+    } >+[]> B;
+    B:LOGITS >:> PACKED
+}
+
+DECODER_ATTENTION(A:MASK) {
+    A >> *dec_q:dec_k:dec_v >[heads]> Q:K:V;
+    REPEAT/heads[]{
+        Q[]*K[]^ >> SCORES;
+        dec_relative_bias >> PARAMETER;
+        SCORES:PARAMETER >> DECODER_BIAS[]() >> BIAS;
+        SCORES+BIAS >> BIASED;
+        BIASED:MASK >> SOFTMAX() >> DROPOUT() >> PROBS;
+        PROBS*V[]
+    } >[]> *dec_o >> DROPOUT() >> B
+}
+DECODER_DENSE_FF(A) {
+    A >> *dec_wi >> RELU() >> DROPOUT() >> *dec_wo >> B;
+    A >> ZERO_ROUTER_LOGITS() >> LOGITS;
+    B:LOGITS >:> PACKED
+}
+DECODER_EXPERT(A) {A >> *dec_expert_wi >> RELU() >> DROPOUT() >> *dec_expert_wo >> B}
+DECODER_SWITCH_FF(A) {
+    A >> ROUTER_JITTER() >> *dec_router >> LOGITS;
+    LOGITS >> ROUTE() >> EXPERT_ID:WEIGHT;
+    A:EXPERT_ID:WEIGHT >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> DECODER_EXPERT[]() >> Y;
+        Y:W >> SCALE() >> Y;
+        Y:POSITIONS:A >> SCATTER() >> Z
+    } >+[]> B;
+    B:LOGITS >:> PACKED
+}
+
+CROSS_ATTENTION(DEC:ENC:MASK) {
+    DEC >> *cross_q >[heads]> Q;
+    ENC >> *cross_k:cross_v >[heads]> K:V;
+    REPEAT/heads[]{
+        Q[]*K[]^ >> SCORES;
+        SCORES:MASK >> SOFTMAX() >> DROPOUT() >> PROBS;
+        PROBS*V[]
+    } >[]> *cross_o >> DROPOUT() >> B
+}
+
+ENCODER(TOKEN_IN:MASK) {
+    TOKEN_IN >> EMBED() >> X;
+    ENCODER_BLOCK/encoder_layers{
+        X;
+        X:enc_ln1[] >> RMSNORM() >> N1;
+        N1:MASK >> ENCODER_ATTENTION[]() >> SA;
+        X+SA >> E;
+        E:enc_ln2[] >> RMSNORM() >> N2;
+        N2 >> CHOOSE?SELECT_ENCODER_FF[](){ENCODER_DENSE_FF[]() | ENCODER_SWITCH_FF[]()} >> UNPACK_FF() >> FF:LOGITS;
+        LOGITS >> ENCODER_ROUTER_STATE{LOGITS >> LOGITS!};
+        FF >> DROPOUT() >> FF;
+        E+FF >> X
+    };
+    enc_final_scale >> PARAMETER;
+    X:PARAMETER >> RMSNORM() >> DROPOUT() >> ENC;
+    // Pack layer logits along columns; the primitive extracts sparse layers
+    // and concatenates their token rows for the reference router objectives.
+    TOKEN_IN >> ENCODER_BLOCK/encoder_layers[]{ENCODER_ROUTER_STATE{LOGITS!}} >[]> PACKED;
+    PACKED >> ENCODER_ROUTER_LOSS() >> ROUTER_LOSS;
+    ENC:ROUTER_LOSS
+}
+
+DECODER(DECODER_IDS:ENC:MASK:DECODER_MASK) {
+    DECODER_IDS >> EMBED() >> X;
+    DECODER_MASK >> CAUSAL_MASK() >> CAUSAL;
+    DECODER_BLOCK/decoder_layers{
+        X;
+        X:dec_ln1[] >> RMSNORM() >> N1;
+        N1:CAUSAL >> DECODER_ATTENTION[]() >> SA;
+        X+SA >> D1;
+        D1:dec_ln2[] >> RMSNORM() >> N2;
+        N2:ENC:MASK >> CROSS_ATTENTION[]() >> CA;
+        D1+CA >> D2;
+        D2:dec_ln3[] >> RMSNORM() >> N3;
+        N3 >> CHOOSE?SELECT_DECODER_FF[](){DECODER_DENSE_FF[]() | DECODER_SWITCH_FF[]()} >> UNPACK_FF() >> FF:LOGITS;
+        LOGITS >> DECODER_ROUTER_STATE{LOGITS >> LOGITS!};
+        FF >> DROPOUT() >> FF;
+        D2+FF >> X
+    };
+    dec_final_scale >> PARAMETER;
+    X:PARAMETER >> RMSNORM() >> DROPOUT() >> HEAD_SCALE() >> H;
+    H*wte^ >> LOGITS;
+    DECODER_IDS >> DECODER_BLOCK/decoder_layers[]{DECODER_ROUTER_STATE{LOGITS!}} >[]> PACKED;
+    PACKED >> DECODER_ROUTER_LOSS() >> ROUTER_LOSS;
+    LOGITS:ROUTER_LOSS
+}
+
+FORWARD(TOKEN_IN:ATTENTION_MASK:TARGETS:DECODER_MASK) {
+    TARGETS >> SHIFT_RIGHT() >> DECODER_IDS;
+    TOKEN_IN:ATTENTION_MASK >> ENCODER() >> ENC:ENC_ROUTER_LOSS;
+    DECODER_IDS:ENC:ATTENTION_MASK:DECODER_MASK >> DECODER() >> LOGITS:DEC_ROUTER_LOSS;
+    LOGITS:TARGETS >> CROSS_ENTROPY() >> TOKEN_LOSS;
+    TOKEN_LOSS+ENC_ROUTER_LOSS+DEC_ROUTER_LOSS >> LOSS;
+    LOSS:LOGITS:TOKEN_LOSS:ENC_ROUTER_LOSS:DEC_ROUTER_LOSS
+}
+
+// Backward uses scalar-loss vector-Jacobian products; the implementation must
+// differentiate the entire retained graph, not just the parameter's last use.
+// Named state scopes below hold detached gradients until the update phase.
+
+D_ENC_Q = model_width%model_width@fp32
+D_ENC_K = model_width%model_width@fp32
+D_ENC_V = model_width%model_width@fp32
+D_ENC_O = model_width%model_width@fp32
+
+ENC_ATTENTION_GRADIENTS(LOSS) {LOSS >> ENC_ATTENTION_GRADIENT_STATE{
+        LOSS:enc_q >> GRADIENT() >> D_ENC_Q!;
+        LOSS:enc_k >> GRADIENT() >> D_ENC_K!;
+        LOSS:enc_v >> GRADIENT() >> D_ENC_V!;
+        LOSS:enc_o >> GRADIENT() >> D_ENC_O!;
+        LOSS
+}}
+
+ENC_ATTENTION_UPDATE(LOSS) {LOSS >> ENC_ATTENTION_GRADIENT_STATE{
+        D_ENC_Q! >> SCALE_GRADIENT() >> STEP;
+        enc_q-STEP >> enc_q;
+        D_ENC_K! >> SCALE_GRADIENT() >> STEP;
+        enc_k-STEP >> enc_k;
+        D_ENC_V! >> SCALE_GRADIENT() >> STEP;
+        enc_v-STEP >> enc_v;
+        D_ENC_O! >> SCALE_GRADIENT() >> STEP;
+        enc_o-STEP >> enc_o;
+        LOSS
+}}
+
+D_ENC_LN1 = 1%model_width@fp32
+D_ENC_LN2 = 1%model_width@fp32
+
+ENC_NORMS_GRADIENTS(LOSS) {LOSS >> ENC_NORMS_GRADIENT_STATE{
+        LOSS:enc_ln1 >> GRADIENT() >> D_ENC_LN1!;
+        LOSS:enc_ln2 >> GRADIENT() >> D_ENC_LN2!;
+        LOSS
+}}
+
+ENC_NORMS_UPDATE(LOSS) {LOSS >> ENC_NORMS_GRADIENT_STATE{
+        D_ENC_LN1! >> SCALE_GRADIENT() >> STEP;
+        enc_ln1-STEP >> enc_ln1;
+        D_ENC_LN2! >> SCALE_GRADIENT() >> STEP;
+        enc_ln2-STEP >> enc_ln2;
+        LOSS
+}}
+
+D_ENC_WI = model_width%ff_width@fp32
+D_ENC_WO = ff_width%model_width@fp32
+
+ENC_DENSE_GRADIENTS(LOSS) {LOSS >> ENC_DENSE_GRADIENT_STATE{
+        LOSS:enc_wi >> GRADIENT() >> D_ENC_WI!;
+        LOSS:enc_wo >> GRADIENT() >> D_ENC_WO!;
+        LOSS
+}}
+
+ENC_DENSE_UPDATE(LOSS) {LOSS >> ENC_DENSE_GRADIENT_STATE{
+        D_ENC_WI! >> SCALE_GRADIENT() >> STEP;
+        enc_wi-STEP >> enc_wi;
+        D_ENC_WO! >> SCALE_GRADIENT() >> STEP;
+        enc_wo-STEP >> enc_wo;
+        LOSS
+}}
+
+D_ENC_ROUTER = model_width%experts@fp32
+
+ENC_ROUTER_GRADIENTS(LOSS) {LOSS >> ENC_ROUTER_GRADIENT_STATE{
+        LOSS:enc_router >> GRADIENT() >> D_ENC_ROUTER!;
+        LOSS
+}}
+
+ENC_ROUTER_UPDATE(LOSS) {LOSS >> ENC_ROUTER_GRADIENT_STATE{
+        D_ENC_ROUTER! >> SCALE_GRADIENT() >> STEP;
+        enc_router-STEP >> enc_router;
+        LOSS
+}}
+
+D_ENC_EXPERT_WI = model_width%ff_width@fp32
+D_ENC_EXPERT_WO = ff_width%model_width@fp32
+
+ENC_EXPERT_GRADIENTS(LOSS) {LOSS >> ENC_EXPERT_GRADIENT_STATE{
+        LOSS:enc_expert_wi >> GRADIENT() >> D_ENC_EXPERT_WI!;
+        LOSS:enc_expert_wo >> GRADIENT() >> D_ENC_EXPERT_WO!;
+        LOSS
+}}
+
+ENC_EXPERT_UPDATE(LOSS) {LOSS >> ENC_EXPERT_GRADIENT_STATE{
+        D_ENC_EXPERT_WI! >> SCALE_GRADIENT() >> STEP;
+        enc_expert_wi-STEP >> enc_expert_wi;
+        D_ENC_EXPERT_WO! >> SCALE_GRADIENT() >> STEP;
+        enc_expert_wo-STEP >> enc_expert_wo;
+        LOSS
+}}
+
+D_DEC_Q = model_width%model_width@fp32
+D_DEC_K = model_width%model_width@fp32
+D_DEC_V = model_width%model_width@fp32
+D_DEC_O = model_width%model_width@fp32
+
+DEC_ATTENTION_GRADIENTS(LOSS) {LOSS >> DEC_ATTENTION_GRADIENT_STATE{
+        LOSS:dec_q >> GRADIENT() >> D_DEC_Q!;
+        LOSS:dec_k >> GRADIENT() >> D_DEC_K!;
+        LOSS:dec_v >> GRADIENT() >> D_DEC_V!;
+        LOSS:dec_o >> GRADIENT() >> D_DEC_O!;
+        LOSS
+}}
+
+DEC_ATTENTION_UPDATE(LOSS) {LOSS >> DEC_ATTENTION_GRADIENT_STATE{
+        D_DEC_Q! >> SCALE_GRADIENT() >> STEP;
+        dec_q-STEP >> dec_q;
+        D_DEC_K! >> SCALE_GRADIENT() >> STEP;
+        dec_k-STEP >> dec_k;
+        D_DEC_V! >> SCALE_GRADIENT() >> STEP;
+        dec_v-STEP >> dec_v;
+        D_DEC_O! >> SCALE_GRADIENT() >> STEP;
+        dec_o-STEP >> dec_o;
+        LOSS
+}}
+
+D_DEC_LN1 = 1%model_width@fp32
+D_DEC_LN2 = 1%model_width@fp32
+D_DEC_LN3 = 1%model_width@fp32
+
+DEC_NORMS_GRADIENTS(LOSS) {LOSS >> DEC_NORMS_GRADIENT_STATE{
+        LOSS:dec_ln1 >> GRADIENT() >> D_DEC_LN1!;
+        LOSS:dec_ln2 >> GRADIENT() >> D_DEC_LN2!;
+        LOSS:dec_ln3 >> GRADIENT() >> D_DEC_LN3!;
+        LOSS
+}}
+
+DEC_NORMS_UPDATE(LOSS) {LOSS >> DEC_NORMS_GRADIENT_STATE{
+        D_DEC_LN1! >> SCALE_GRADIENT() >> STEP;
+        dec_ln1-STEP >> dec_ln1;
+        D_DEC_LN2! >> SCALE_GRADIENT() >> STEP;
+        dec_ln2-STEP >> dec_ln2;
+        D_DEC_LN3! >> SCALE_GRADIENT() >> STEP;
+        dec_ln3-STEP >> dec_ln3;
+        LOSS
+}}
+
+D_DEC_WI = model_width%ff_width@fp32
+D_DEC_WO = ff_width%model_width@fp32
+
+DEC_DENSE_GRADIENTS(LOSS) {LOSS >> DEC_DENSE_GRADIENT_STATE{
+        LOSS:dec_wi >> GRADIENT() >> D_DEC_WI!;
+        LOSS:dec_wo >> GRADIENT() >> D_DEC_WO!;
+        LOSS
+}}
+
+DEC_DENSE_UPDATE(LOSS) {LOSS >> DEC_DENSE_GRADIENT_STATE{
+        D_DEC_WI! >> SCALE_GRADIENT() >> STEP;
+        dec_wi-STEP >> dec_wi;
+        D_DEC_WO! >> SCALE_GRADIENT() >> STEP;
+        dec_wo-STEP >> dec_wo;
+        LOSS
+}}
+
+D_DEC_ROUTER = model_width%experts@fp32
+
+DEC_ROUTER_GRADIENTS(LOSS) {LOSS >> DEC_ROUTER_GRADIENT_STATE{
+        LOSS:dec_router >> GRADIENT() >> D_DEC_ROUTER!;
+        LOSS
+}}
+
+DEC_ROUTER_UPDATE(LOSS) {LOSS >> DEC_ROUTER_GRADIENT_STATE{
+        D_DEC_ROUTER! >> SCALE_GRADIENT() >> STEP;
+        dec_router-STEP >> dec_router;
+        LOSS
+}}
+
+D_DEC_EXPERT_WI = model_width%ff_width@fp32
+D_DEC_EXPERT_WO = ff_width%model_width@fp32
+
+DEC_EXPERT_GRADIENTS(LOSS) {LOSS >> DEC_EXPERT_GRADIENT_STATE{
+        LOSS:dec_expert_wi >> GRADIENT() >> D_DEC_EXPERT_WI!;
+        LOSS:dec_expert_wo >> GRADIENT() >> D_DEC_EXPERT_WO!;
+        LOSS
+}}
+
+DEC_EXPERT_UPDATE(LOSS) {LOSS >> DEC_EXPERT_GRADIENT_STATE{
+        D_DEC_EXPERT_WI! >> SCALE_GRADIENT() >> STEP;
+        dec_expert_wi-STEP >> dec_expert_wi;
+        D_DEC_EXPERT_WO! >> SCALE_GRADIENT() >> STEP;
+        dec_expert_wo-STEP >> dec_expert_wo;
+        LOSS
+}}
+
+D_CROSS_Q = model_width%model_width@fp32
+D_CROSS_K = model_width%model_width@fp32
+D_CROSS_V = model_width%model_width@fp32
+D_CROSS_O = model_width%model_width@fp32
+
+CROSS_ATTENTION_GRADIENTS(LOSS) {LOSS >> CROSS_ATTENTION_GRADIENT_STATE{
+        LOSS:cross_q >> GRADIENT() >> D_CROSS_Q!;
+        LOSS:cross_k >> GRADIENT() >> D_CROSS_K!;
+        LOSS:cross_v >> GRADIENT() >> D_CROSS_V!;
+        LOSS:cross_o >> GRADIENT() >> D_CROSS_O!;
+        LOSS
+}}
+
+CROSS_ATTENTION_UPDATE(LOSS) {LOSS >> CROSS_ATTENTION_GRADIENT_STATE{
+        D_CROSS_Q! >> SCALE_GRADIENT() >> STEP;
+        cross_q-STEP >> cross_q;
+        D_CROSS_K! >> SCALE_GRADIENT() >> STEP;
+        cross_k-STEP >> cross_k;
+        D_CROSS_V! >> SCALE_GRADIENT() >> STEP;
+        cross_v-STEP >> cross_v;
+        D_CROSS_O! >> SCALE_GRADIENT() >> STEP;
+        cross_o-STEP >> cross_o;
+        LOSS
+}}
+
+D_WTE = vocab_size%model_width@fp32
+D_ENC_RELATIVE_BIAS = relative_buckets%heads@fp32
+D_DEC_RELATIVE_BIAS = relative_buckets%heads@fp32
+D_ENC_FINAL_SCALE = 1%model_width@fp32
+D_DEC_FINAL_SCALE = 1%model_width@fp32
+
+SHARED_GRADIENTS(LOSS) {LOSS >> SHARED_GRADIENT_STATE{
+        wte >> PARAMETER;
+        LOSS:PARAMETER >> GRADIENT() >> D_WTE!;
+        enc_relative_bias >> PARAMETER;
+        LOSS:PARAMETER >> GRADIENT() >> D_ENC_RELATIVE_BIAS!;
+        dec_relative_bias >> PARAMETER;
+        LOSS:PARAMETER >> GRADIENT() >> D_DEC_RELATIVE_BIAS!;
+        enc_final_scale >> PARAMETER;
+        LOSS:PARAMETER >> GRADIENT() >> D_ENC_FINAL_SCALE!;
+        dec_final_scale >> PARAMETER;
+        LOSS:PARAMETER >> GRADIENT() >> D_DEC_FINAL_SCALE!;
+        LOSS
+}}
+
+SHARED_UPDATE(LOSS) {LOSS >> SHARED_GRADIENT_STATE{
+        D_WTE! >> SCALE_GRADIENT() >> STEP;
+        wte-STEP >> wte;
+        D_ENC_RELATIVE_BIAS! >> SCALE_GRADIENT() >> STEP;
+        enc_relative_bias-STEP >> enc_relative_bias;
+        D_DEC_RELATIVE_BIAS! >> SCALE_GRADIENT() >> STEP;
+        dec_relative_bias-STEP >> dec_relative_bias;
+        D_ENC_FINAL_SCALE! >> SCALE_GRADIENT() >> STEP;
+        enc_final_scale-STEP >> enc_final_scale;
+        D_DEC_FINAL_SCALE! >> SCALE_GRADIENT() >> STEP;
+        dec_final_scale-STEP >> dec_final_scale;
+        LOSS
+}}
+
+ENCODER_GRADIENTS(LOSS) {
+    LOSS >> ENC_ATTENTION_GRADIENTS() >> ENC_NORMS_GRADIENTS() >> LOSS;
+    LOSS >> CHOOSE?SELECT_ENCODER_FF[](){
+        ENC_DENSE_GRADIENTS() |
+        ENC_ROUTER_GRADIENTS() >> EXPERT_PARAMETERS/experts{ENC_EXPERT_GRADIENTS[]()}
+    } >> LOSS
+}
+
+DECODER_GRADIENTS(LOSS) {
+    LOSS >> DEC_ATTENTION_GRADIENTS() >> DEC_NORMS_GRADIENTS() >> LOSS;
+    LOSS >> CROSS_ATTENTION_GRADIENTS() >> LOSS;
+    LOSS >> CHOOSE?SELECT_DECODER_FF[](){
+        DEC_DENSE_GRADIENTS() |
+        DEC_ROUTER_GRADIENTS() >> EXPERT_PARAMETERS/experts{DEC_EXPERT_GRADIENTS[]()}
+    } >> LOSS
+}
+
+GRADIENTS(LOSS) {
+    LOSS >> DECODER_PARAMETERS\decoder_layers{DECODER_GRADIENTS[]()} >> LOSS;
+    LOSS >> ENCODER_PARAMETERS\encoder_layers{ENCODER_GRADIENTS[]()} >> LOSS;
+    LOSS >> SHARED_GRADIENTS() >> LOSS
+}
+
+ENCODER_UPDATE(LOSS) {
+    LOSS >> ENC_ATTENTION_UPDATE() >> ENC_NORMS_UPDATE() >> LOSS;
+    LOSS >> CHOOSE?SELECT_ENCODER_FF[](){
+        ENC_DENSE_UPDATE() |
+        ENC_ROUTER_UPDATE() >> EXPERT_PARAMETERS/experts{ENC_EXPERT_UPDATE[]()}
+    } >> LOSS
+}
+
+DECODER_UPDATE(LOSS) {
+    LOSS >> DEC_ATTENTION_UPDATE() >> DEC_NORMS_UPDATE() >> LOSS;
+    LOSS >> CROSS_ATTENTION_UPDATE() >> LOSS;
+    LOSS >> CHOOSE?SELECT_DECODER_FF[](){
+        DEC_DENSE_UPDATE() |
+        DEC_ROUTER_UPDATE() >> EXPERT_PARAMETERS/experts{DEC_EXPERT_UPDATE[]()}
+    } >> LOSS
+}
+
+UPDATE(LOSS) {
+    LOSS >> DECODER_PARAMETERS\decoder_layers{DECODER_UPDATE[]()} >> LOSS;
+    LOSS >> ENCODER_PARAMETERS\encoder_layers{ENCODER_UPDATE[]()} >> LOSS;
+    LOSS >> SHARED_UPDATE() >> LOSS
+}
+
+SWITCH_BASE_8_TRAINING(TOKEN_IN:ATTENTION_MASK:TARGETS:DECODER_MASK) {
+    TOKEN_IN:ATTENTION_MASK:TARGETS:DECODER_MASK >> FORWARD() >>
+    LOSS:LOGITS:TOKEN_LOSS:ENC_ROUTER_LOSS:DEC_ROUTER_LOSS;
+    LOSS >> GRADIENTS() >> UPDATE() >> REPORT_LOSS() >> LOSS
+}

@@ -1,0 +1,168 @@
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_KV_LATENT(A) {ops_per_element = 0}
+// External operations supplied by the model backend.
+// Default cost placeholder: routing selection costs depend on expert count and selection algorithm.
+ROUTER(A) {}
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+DISPATCH(A:B:C) {ops_per_element = 0}
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+EMBED(TOKEN_IN:A) {}
+// Default cost placeholder: projection requires shape-dependent matrix multiplication costs.
+LMHEAD() {}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RMSNORM(A) {ops_per_element = 5}
+// Uncalibrated estimate: Two multiplies and one add per element; assumes precomputed sin/cos, whose reads are not modeled.
+ROPE(KR) {ops_per_element = 3}
+SAMPLE(A) {}
+SCALE(Y:W) {}
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+SCATTER(Y:POSITIONS:A) {ops_per_element = 0}
+// Uncalibrated estimate: Five scalar operations per element; exp/div each count as one, not calibrated hardware latency.
+SILU(DG) {ops_per_element = 5}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+SOFTMAX(A) {ops_per_element = 5}
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_KV(KVH) {ops_per_element = 0}
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_Q(QH) {ops_per_element = 0}
+
+// ============================================================
+// DEEPSEEK R1 INFERENCE
+// ============================================================
+
+layers = 61
+dense_layers = 3
+moe_layers = 58
+experts = 256
+active_experts = 8
+model_width = 7168
+expert_width = 2048
+// Architecture: https://huggingface.co/deepseek-ai/DeepSeek-R1/blob/main/config.json
+// Full BF8 weights/activations for sizing; this is not the FP8 checkpoint layout.
+// One-token prefill, no persistent KV cache. The existing MOE scope executes
+// all 256 experts: this is an all-expert upper-bound graph, not top-8 routing.
+tokens = 10000
+heads = 128
+dense_width = 18432
+vocab_size = 129280
+q_rank = 1536
+kv_rank = 512
+kv_compressed_width = 576
+q_projection_width = 24576
+kv_projection_width = 32768
+attention_output_width = 16384
+
+q_a[layers] = model_width%q_rank@bf8
+q_b[layers] = q_rank%q_projection_width@bf8
+kv_a[layers] = model_width%kv_compressed_width@bf8
+kv_b[layers] = kv_rank%kv_projection_width@bf8
+o[layers] = attention_output_width%model_width@bf8
+dense_gate[dense_layers] = model_width%dense_width@bf8
+dense_up[dense_layers] = model_width%dense_width@bf8
+dense_down[dense_layers] = dense_width%model_width@bf8
+gate = model_width%expert_width@bf8
+up = model_width%expert_width@bf8
+down = expert_width%model_width@bf8
+shared_gate[moe_layers] = model_width%expert_width@bf8
+shared_up[moe_layers] = model_width%expert_width@bf8
+shared_down[moe_layers] = expert_width%model_width@bf8
+router[moe_layers] = model_width%experts@bf8
+embedding = vocab_size%model_width@bf8
+lm_head = model_width%vocab_size@bf8
+
+A = tokens%model_width@bf8
+B = tokens%model_width@bf8
+X = tokens%model_width@bf8
+Y = tokens%model_width@bf8
+Z = tokens%model_width@bf8
+C = tokens%kv_rank@bf8
+KR = tokens%64@bf8
+KRP = tokens%64@bf8
+QN = tokens%128@bf8
+QR = tokens%64@bf8
+QRP = tokens%64@bf8
+KN = tokens%128@bf8
+V = tokens%128@bf8
+G = tokens%expert_width@bf8
+U = tokens%expert_width@bf8
+DG = tokens%dense_width@bf8
+DU = tokens%dense_width@bf8
+W = tokens%1@bf8
+POSITIONS = tokens@int32
+ASSIGNMENTS = tokens%active_experts@int32
+PROBABILITIES = tokens%active_experts@bf8
+
+TOKEN_IN = tokens@int32
+TOKEN_OUT = tokens@int32
+
+MLP(A) {
+    A >> {*dense_gate:dense_up} >> DG:DU;
+    DG >> SILU() >> DS;
+    DS:DU >> MUL_ELEMENTS() >> DT;
+    DT >> *dense_down >> B
+}
+
+MLA(A) {
+    A >> {*q_a >> RMSNORM() >> *q_b} >> Q;
+    A >> *kv_a >> SPLIT_KV_LATENT() >> C:KR;
+    C >> {RMSNORM() >> *kv_b} >> KV;
+    KR >> ROPE() >> KRP;
+    Q:KV >[128]> QH:KVH;
+    REPEAT/128[]{
+        QH[] >> SPLIT_Q() >> QN:QR;
+        KVH[] >> SPLIT_KV() >> KN:V;
+        QR >> ROPE() >> QRP;
+        {QN*KN^} >> S1;
+        {QRP*KRP^} >> S2;
+        {S1+S2 >> SOFTMAX() >> *V}
+    } >[]>  {*o} >> B
+}
+
+// ============================================================
+// DEEPSEEK R1 EXPERT
+// ============================================================
+
+EXPERT(A) {
+    A >> {*gate[]:up[]} >> G:U;
+    G >> SILU() >> S;
+    S:U >> MUL_ELEMENTS() >> T;
+    T >> {*down[]} >> B
+}
+
+SHARED_EXPERT(A) {
+    A >> {*shared_gate:shared_up} >> G:U;
+    G >> SILU() >> S;
+    S:U >> MUL_ELEMENTS() >> T;
+    T >> *shared_down >> B
+}
+
+MOE(A) {
+    A*router >> ROUTER() >> ASSIGNMENTS:PROBABILITIES;
+    A:ASSIGNMENTS:PROBABILITIES >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> EXPERT[]() >> Y;
+        Y:W >> SCALE() >> Y;
+        Y:POSITIONS:A >> SCATTER() >> Z
+    } >+[]> R;
+    A >> SHARED_EXPERT() >> H;
+    {R+H} >> B
+}
+
+DENSE_LAYER(A) {
+    A >> RMSNORM() >> MLA() >> D;
+    {D+A} >> E >> RMSNORM() >> MLP() >> F;
+    {F+E} >> B
+}
+
+MOE_LAYER(A) {
+    A >> RMSNORM() >> MLA() >> D;
+    {D+A} >> E >> RMSNORM() >> MOE() >> F;
+    {F+E} >> B
+}
+
+DEEPSEEK_R1(TOKEN_IN) {
+    TOKEN_IN:embedding >> EMBED() >> A >>
+    REPEAT/dense_layers{DENSE_LAYER[]()} >>
+    REPEAT/moe_layers{MOE_LAYER[]()} >>
+    RMSNORM() >> *lm_head >> SAMPLE() >> TOKEN_OUT
+}

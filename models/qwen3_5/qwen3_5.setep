@@ -1,0 +1,256 @@
+// External operations supplied by the model backend.
+APPLY_MASK(A) {}
+// Default cost placeholder: convolution costs depend on kernel width and channels.
+CAUSAL_CONV(QKV:A) {}
+// Default cost placeholder: delta-rule arithmetic/read costs depend on state and chunk shapes.
+CHUNK_DELTA_RULE(A:B:C:D:E) {}
+DELTA_SELECT(A) {}
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+EMBED(TOKEN_IN:A) {}
+GATE(AA:A:B) {}
+INSERT_MODAL_EMBEDS(T:IMAGE_EMBED:VIDEO_EMBED) {}
+// Default cost placeholder: combined normalization/gating needs an implementation-specific estimate.
+NORM(CORE:Z:A) {}
+// Default cost placeholder: patch projection requires shape-dependent costs.
+PATCH_EMBED(PIXELS:A) {}
+POSITION_EMBED(A:B) {}
+// Default cost placeholder: attention needs shape- and sequence-dependent arithmetic/read costs.
+QWEN3_NEXT_ATTENTION(FQ:FK:FV:A:B) {}
+// Uncalibrated estimate: Five scalar operations per element; exp/div each count as one, not calibrated hardware latency.
+SILU(MG) {ops_per_element = 5}
+// Uncalibrated estimate: Four scalar operations per element; exp/div each count as one, not calibrated hardware latency.
+SIGMOID(A) {ops_per_element = 4}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+QWEN3_NEXT_RMSNORM(A:B) {ops_per_element = 5}
+// Default cost placeholder: the full vision computation needs decomposition or measured timing.
+QWEN3_VL_VISION_MODEL(B) {}
+// Default cost placeholder: delta-rule arithmetic/read costs depend on state shapes.
+RECURRENT_DELTA_RULE(A:B:C:D:E) {}
+SELECT(A) {}
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_QKV(QKV_C) {ops_per_element = 0}
+
+// ============================================================
+// QWEN3.5-9B - BF16 TEXT INFERENCE
+// Dimensions: https://huggingface.co/Qwen/Qwen3.5-9B/blob/main/config.json
+// One-token prefill; persistent KV/recurrent caches are not modeled.
+// External attention/delta kernels remain shape contracts, not numerical implementations.
+// The final entry is text-only; the optional vision/multimodal helpers below
+// remain schematic and are excluded from its placement and traffic report.
+// ============================================================
+
+vocab_size = 248320
+hidden_size = 4096
+intermediate_size = 12288
+num_hidden_layers = 32
+num_key_value_heads = 4
+
+linear_conv_kernel_dim = 4
+linear_key_head_dim = 128
+linear_value_head_dim = 128
+linear_num_key_heads = 16
+linear_num_value_heads = 32
+
+
+// Optional vision helper boundary: one 16x16 grid of flattened 2-frame patches.
+vision_depth = 27
+vision_hidden_size = 1152
+vision_intermediate_size = 4304
+vision_num_heads = 16
+vision_position_count = 2304
+vision_patches = 256
+vision_patch_elements = 1536
+vision_output_tokens = 64
+vision_patch = vision_patch_elements%vision_hidden_size@bf16
+vision_position = vision_position_count%vision_hidden_size@bf16
+IMAGE_IN = vision_patches%vision_patch_elements@bf16
+VIDEO_IN = vision_patches%vision_patch_elements@bf16
+VISION_OUT = vision_output_tokens%hidden_size@bf16
+
+tokens = 64
+layer_groups = 8
+linear_layers_per_group = 3
+num_attention_heads = 16
+head_dim = 256
+linear_key_width = 2048
+linear_value_width = 4096
+linear_qkv_width = 8192
+full_query_gate_width = 8192
+full_kv_width = 1024
+
+in_proj_qkv[num_hidden_layers] = hidden_size%linear_qkv_width@bf16
+in_proj_z[num_hidden_layers] = hidden_size%linear_value_width@bf16
+in_proj_b[num_hidden_layers] = hidden_size%linear_num_value_heads@bf16
+in_proj_a[num_hidden_layers] = hidden_size%linear_num_value_heads@bf16
+out_proj[num_hidden_layers] = linear_value_width%hidden_size@bf16
+conv_kernel[num_hidden_layers] = linear_qkv_width%linear_conv_kernel_dim@bf16
+a_log[num_hidden_layers] = 1%linear_num_value_heads@fp32
+dt_bias[num_hidden_layers] = 1%linear_num_value_heads@fp32
+delta_norm[num_hidden_layers] = 1%linear_value_head_dim@bf16
+full_q[num_hidden_layers] = hidden_size%full_query_gate_width@bf16
+full_k[num_hidden_layers] = hidden_size%full_kv_width@bf16
+full_v[num_hidden_layers] = hidden_size%full_kv_width@bf16
+full_o[num_hidden_layers] = hidden_size%hidden_size@bf16
+q_norm[num_hidden_layers] = 1%head_dim@bf16
+k_norm[num_hidden_layers] = 1%head_dim@bf16
+mlp_gate[num_hidden_layers] = hidden_size%intermediate_size@bf16
+mlp_up[num_hidden_layers] = hidden_size%intermediate_size@bf16
+mlp_down[num_hidden_layers] = intermediate_size%hidden_size@bf16
+norm_weight[num_hidden_layers] = 1%hidden_size@bf16
+embedding = vocab_size%hidden_size@bf16
+lm_head = hidden_size%vocab_size@bf16
+
+TOKEN_IN = tokens@int32
+TEXT_OUT = tokens%hidden_size@bf16
+LOGITS = tokens%vocab_size@bf16
+QKV = tokens%linear_qkv_width@bf16
+QKV_C = tokens%linear_qkv_width@bf16
+Q = tokens%linear_key_width@bf16
+K = tokens%linear_key_width@bf16
+V = tokens%linear_value_width@bf16
+Z = tokens%linear_value_width@bf16
+BETA = tokens%linear_num_value_heads@bf16
+AA = tokens%linear_num_value_heads@bf16
+G = tokens%linear_num_value_heads@fp32
+CORE = tokens%linear_value_width@bf16
+FULL_CORE = tokens%hidden_size@bf16
+
+// ============================================================
+// GATED DELTA NET
+//
+// DELTA_SELECT chooses recurrent or chunk processing from the
+// input/cache state. It does not require repetition information.
+// ============================================================
+
+GATED_DELTA_NET(A) {
+    A = tokens%hidden_size@bf16;
+    B = tokens%hidden_size@bf16;
+    A >> APPLY_MASK() >> X;
+    X >> {*in_proj_qkv} >> QKV;
+    X >> {*in_proj_z} >> Z;
+    X >> {*in_proj_b >> SIGMOID()} >> BETA;
+    X >> {*in_proj_a} >> AA;
+    QKV:conv_kernel >> CAUSAL_CONV() >> QKV_C;
+    QKV_C >> SPLIT_QKV() >> Q:K:V;
+    AA:a_log:dt_bias >> GATE() >> G;
+    Q:K:V:G:BETA >>
+        CHOOSE?DELTA_SELECT(){RECURRENT_DELTA_RULE() | CHUNK_DELTA_RULE()} >> CORE;
+    CORE:Z:delta_norm >> NORM() >> N;
+    N >> {*out_proj} >> B
+}
+
+
+// ============================================================
+// INHERITED COMPUTATIONS
+// ============================================================
+
+FULL_ATTENTION(A) {
+    A = tokens%hidden_size@bf16;
+    B = tokens%hidden_size@bf16;
+    A*full_q >> FQ; A*full_k >> FK; A*full_v >> FV;
+    FQ:FK:FV:q_norm:k_norm >> QWEN3_NEXT_ATTENTION() >> FULL_CORE;
+    FULL_CORE >> *full_o >> B
+}
+
+MLP(A) {
+    A = tokens%hidden_size@bf16;
+    B = tokens%hidden_size@bf16;
+    A >> {*mlp_gate:mlp_up} >> MG:MU;
+    MG >> SILU() >> MS;
+    MS:MU >> MUL_ELEMENTS() >> MT;
+    MT >> *mlp_down >> B
+}
+
+RMSNORM(A) {
+    A = tokens%hidden_size@bf16;
+    B = tokens%hidden_size@bf16;
+    A:norm_weight >> QWEN3_NEXT_RMSNORM() >> B
+}
+
+
+// ============================================================
+// DECODER LAYER
+//
+// SELECT[] receives the current layer repetition information.
+// For Qwen3.5 it selects according to config.layer_types[layer_idx].
+// It can ignore the activation N.
+// ============================================================
+
+DECODER_LAYER(A) {
+    A >> RMSNORM() >> N;
+    N >> CHOOSE?SELECT[](){GATED_DELTA_NET() | FULL_ATTENTION()} >> T;
+    {A+T} >> B;
+    B >> RMSNORM() >> MLP() >> M;
+    {B+M} >> C
+}
+
+
+// ============================================================
+// TEXT MODEL
+//
+// The configured text entry uses the fixed 3-linear/1-full schedule below.
+// DECODER_LAYER above remains a generic selector-based helper.
+// ============================================================
+
+// Static text schedule matches layer_types: 24 linear and 8 full layers.
+// Delta kernel choice remains conditional; action lowering conservatively
+// includes both kernel branches. Persistent cache storage is excluded.
+LINEAR_LAYER(A) {
+    A = tokens%hidden_size@bf16;
+    A >> RMSNORM() >> GATED_DELTA_NET() >> L;
+    {A+L} >> R >> RMSNORM() >> MLP() >> M;
+    {R+M} >> B
+}
+FULL_LAYER(A) {
+    A = tokens%hidden_size@bf16;
+    A >> RMSNORM() >> FULL_ATTENTION() >> L;
+    {A+L} >> R >> RMSNORM() >> MLP() >> M;
+    {R+M} >> B
+}
+TEXT_STACK(A) {
+    A = tokens%hidden_size@bf16;
+    A >> REPEAT/layer_groups{REPEAT/linear_layers_per_group{LINEAR_LAYER[]()} >> FULL_LAYER[]()} >>
+    RMSNORM() >> TEXT_OUT
+}
+TEXT_MODEL(TOKEN_IN) {
+    TOKEN_IN:embedding >> EMBED() >> TEXT_OUT >> TEXT_STACK() >> TEXT_OUT
+}
+
+
+// ============================================================
+// VISION MODEL
+//
+// Most vision processing is inherited from Qwen3VL.
+// ============================================================
+
+VISION_MODEL(PIXELS) {
+    PIXELS = vision_patches%vision_patch_elements@bf16;
+    A = vision_patches%vision_hidden_size@bf16;
+    P = vision_patches%vision_hidden_size@bf16;
+    PIXELS:vision_patch >> PATCH_EMBED() >> A;
+    A:vision_position >> POSITION_EMBED() >> P;
+    {A+P} >> B;
+    B >> QWEN3_VL_VISION_MODEL() >> VISION_OUT
+}
+
+
+// ============================================================
+// MULTIMODAL MODEL
+// ============================================================
+
+QWEN3_5_MODEL(TOKEN_IN:IMAGE_IN:VIDEO_IN) {
+    TOKEN_IN:embedding >> EMBED() >> T;
+    IMAGE_IN >> VISION_MODEL() >> IMAGE_EMBED;
+    VIDEO_IN >> VISION_MODEL() >> VIDEO_EMBED;
+    T:IMAGE_EMBED:VIDEO_EMBED >> INSERT_MODAL_EMBEDS() >> MM;
+    MM >> TEXT_STACK() >> TEXT_OUT
+}
+
+
+// ============================================================
+// CAUSAL LANGUAGE MODEL
+// ============================================================
+
+QWEN3_5_CAUSAL_LM(TOKEN_IN) {
+    TOKEN_IN >> TEXT_MODEL() >> *lm_head >> LOGITS
+}

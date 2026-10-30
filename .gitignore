@@ -1,0 +1,24 @@
+# Build trees
+build/
+build-*/
+out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated outputs (regenerate with the setep tool)
+models/**/*.py
+!models/**/*_impl.py
+!models/switch_base_8/switch_ref.py
+models/**/*.et
+models/**/*.chakra.json
+models/**/*.onnx
+models/**/*.onnx-export.json
+models/**/*.weights.npz
+
+# Downloaded checkpoints and tokenizer files
+models/switch_base_8/switch-base-8/
+*.safetensors
+eval/**/gen/

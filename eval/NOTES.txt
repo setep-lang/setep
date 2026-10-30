@@ -1,0 +1,53 @@
+SETEP paper evaluation: how each result set is reproduced with the setep tool.
+
+Environment of the published run: Windows 11, MSYS2 UCRT64 g++ 16.1.0, CMake 4.3.3,
+Python 3.14.7, torch 2.15.0+cpu, transformers 5.22.0, onnx 1.23.2,
+onnxruntime 1.31.0, safetensors 0.8.0, tiktoken 0.14.0, numpy 2.5.4
+(eval/requirements-eval.txt). Hugging Face gpt2 snapshot
+607a30d783dfa663caf39e06633721c8d4cfcd7e. ASTRA-sim analytical
+(congestion unaware) build, run under WSL.
+
+Below, ROOT is the setep checkout (built in ROOT/build) and OUT a scratch
+directory. Big outputs (checkpoints, ONNX files, traces) are not kept here.
+
+1  Description size and coverage, and the generated Python used by 2:
+     python eval/size_coverage.py ROOT OUT          -> OUT/size_coverage.csv/.txt, OUT/gen/<model>/
+
+2  GPT-2 against Hugging Face (fp32, CPU):
+     python eval/gpt2/make_checkpoint.py OUT/gpt2.safetensors
+     cp models/chatgpt2/chatgpt2_impl.py OUT/gen/chatgpt2/
+     python eval/gpt2/compare_hf.py OUT/gen/chatgpt2 OUT/gpt2.safetensors OUT/compare_hf.json
+   ONNX export with Hugging Face weights, run in onnxruntime against the generated
+   PyTorch model and Hugging Face (exports once with --zero-weights to list the
+   weight names, writes OUT/onnx/chatgpt2.weights.npz, exports again with it):
+     python eval/gpt2/onnx_gpt2.py ROOT OUT/onnx OUT/gen/chatgpt2 OUT/gpt2.safetensors OUT/onnx_gpt2.json
+     python eval/gpt2/onnx_check.py OUT/onnx/chatgpt2.onnx
+   Training, two SGD steps against Hugging Face + torch.optim.SGD:
+     cp models/chatgpt2/chatgpt2_training_impl.py OUT/gen/chatgpt2_training/
+     python OUT/gen/chatgpt2_training/chatgpt2_training_impl.py --weights OUT/gpt2.safetensors \
+         --learning-rate 0.0001 --steps 2 --save-weights OUT/trained.safetensors   (prints both losses)
+     python eval/gpt2/train_vs_hf.py OUT/gpt2.safetensors OUT/trained.safetensors
+   gpt2/loss_probe.py checks which loss convention reproduces the first SETEP loss.
+
+3  Distributed Chakra export sweep (all cases: eval/chakra/run_all.ps1):
+     python eval/chakra/chakra_sweep.py ROOT OUT/chakra/gpt2 gpt2=models/chatgpt2/chatgpt2.setep 100000,500,400,300,200,160
+     python eval/chakra/chakra_sweep.py ROOT OUT/chakra/gpt2 gpt2=models/chatgpt2/chatgpt2.setep 600 replicas=4
+     python eval/chakra/make_table.py OUT/chakra     -> OUT/chakra/chakra_table.txt
+   Each case runs
+     setep MODEL --chakra -o CASE --nodes 64 --processors-per-node 64 --hosts-per-node 0 \
+           --sequences 1 --replicas R --memory-mb MEM
+   i.e. an inventory of 4096 accelerators and no host processors, one sequence,
+   one replica unless replicas=N is given, MEM MB per accelerator; then decodes
+   and checks every trace with tools/chakra_trace.py.
+
+4  ASTRA-sim on every exported case (Ring network, 50 GB/s, 500 ns; system
+   configuration models/chatgpt2/chatgpt2_chunk.json; no memory expansion):
+     MSYS_NO_PATHCONV=1 wsl bash /mnt/c/.../eval/astra/run_astra.sh /mnt/c/.../OUT   -> OUT/astra/results.csv
+   eval/astra/one.sh PREFIX runs a single case.
+
+Published numbers: chakra/chakra_table-paper.txt and astra/results-paper.csv.
+Reproduced with this tool: every Chakra case of the table decodes to the same
+nodes, dependencies, durations, tensor shapes and payloads, and the ASTRA-sim
+cycle counts re-run so far (GPT-2 at 500 and 160 MB) are equal. The trace_bytes
+column is 3 bytes per compute node smaller than the published column, because the per-node identity attributes are now called
+setep_operation_id / setep_replica / setep_sequence.

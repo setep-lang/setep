@@ -1,0 +1,4 @@
+# Optional test dependencies: the PyTorch and ONNX tests are skipped without them.
+-r requirements-onnx.txt
+onnxruntime==1.31.0
+torch

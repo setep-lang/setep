@@ -1,0 +1,352 @@
+// ============================================================
+// CHATGPT2 TRAINING - ONE TRAINING STEP
+// ============================================================
+
+text_in = 100
+tokens = 10
+positions = 1024
+layers = 12
+heads = 12
+model_width = 768
+mlp_width = 3072
+vocab_size = 50257
+eta = 1
+
+TEXT_IN = text_in@int8
+TOKEN_IN = tokens@int32
+TARGETS = tokens@int32
+ATTENTION_MASK = tokens@int32
+POSITION_IDS = tokens@int32
+LOSS = 1@fp32
+
+q[layers] = model_width%model_width@fp32
+k[layers] = model_width%model_width@fp32
+v[layers] = model_width%model_width@fp32
+o[layers] = model_width%model_width@fp32
+
+up[layers] = model_width%mlp_width@fp32
+down[layers] = mlp_width%model_width@fp32
+
+wte = vocab_size%model_width@fp32
+wpe = positions%model_width@fp32
+
+qb[layers] = 1%model_width@fp32
+kb[layers] = 1%model_width@fp32
+vb[layers] = 1%model_width@fp32
+ob[layers] = 1%model_width@fp32
+
+up_bias[layers] = 1%mlp_width@fp32
+down_bias[layers] = 1%model_width@fp32
+
+ln1_scale[layers] = 1%model_width@fp32
+ln1_bias[layers] = 1%model_width@fp32
+ln2_scale[layers] = 1%model_width@fp32
+ln2_bias[layers] = 1%model_width@fp32
+lnf_scale = 1%model_width@fp32
+lnf_bias = 1%model_width@fp32
+
+
+// ============================================================
+// ABSTRACT FORWARD COMPUTATIONS
+// ============================================================
+
+// Uncalibrated estimate: Layer normalization without affine parameters: approximate six operations per element.
+NORMALIZE(A) {ops_per_element = 6}
+SCALE(N:A) {}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+SOFTMAX(SCORES:ATTENTION_MASK) {ops_per_element = 5}
+// Uncalibrated estimate: Tanh approximation: nine scalar operations per element; tanh counts as one, not calibrated latency.
+GELU(A) {ops_per_element = 9}
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+LOOKUP(IDS:A) {}
+
+TRAIN_TOKENIZE(TEXT_IN) {}
+
+CROSS_ENTROPY(LOGITS:TARGETS) {}
+
+
+// ============================================================
+// ABSTRACT BACKWARD COMPUTATIONS
+//
+// Input tensor groups are inferred from call sites; each returns one gradient.
+// Implementations differentiate the corresponding local forward operation.
+// ============================================================
+
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+CROSS_ENTROPY_BACK(LOGITS:TARGETS) {}
+
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+LMHEAD_INPUT_GRAD(F:DLOGITS) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+LMHEAD_WEIGHT_GRAD(F:DLOGITS) {}
+
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+LOOKUP_GRAD(TOKEN_IN:D_EMBED) {}
+
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+LN_INPUT_GRAD(H:DF) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+LN_SCALE_GRAD(H:DF) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+LN_BIAS_GRAD(H:DF) {}
+
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+MLP_INPUT_GRAD(N2:DG) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+MLP_UP_GRAD(N2:DG) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+MLP_UP_BIAS_GRAD(N2:DG) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+MLP_DOWN_GRAD(N2:DG) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+MLP_DOWN_BIAS_GRAD(N2:DG) {}
+
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_INPUT_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_Q_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_K_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_V_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_O_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_Q_BIAS_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_K_BIAS_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_V_BIAS_GRAD(N1:ATTENTION_MASK:DD) {}
+// Default cost placeholder: backward work needs shape-dependent costs or measured timing.
+ATTN_O_BIAS_GRAD(N1:ATTENTION_MASK:DD) {}
+
+
+// ============================================================
+// NORMALIZATION
+// ============================================================
+
+LN1(A) {
+    A = tokens%model_width@fp32;
+    A >> NORMALIZE() >> N;
+    N:ln1_scale >> SCALE() >> B >> +ln1_bias >> B
+}
+
+LN2(A) {
+    A = tokens%model_width@fp32;
+    A >> NORMALIZE() >> N;
+    N:ln2_scale >> SCALE() >> B >> +ln2_bias >> B
+}
+
+FINAL_LN(A) {
+    A = tokens%model_width@fp32;
+    A >> NORMALIZE() >> N;
+    N:lnf_scale >> SCALE() >> B >> +lnf_bias >> B
+}
+
+
+// ============================================================
+// MLP
+// ============================================================
+
+MLP(A) {
+    A >> *up +up_bias >> GELU() >> *down +down_bias >> B
+}
+
+
+// ============================================================
+// SHARED EMBEDDING / LM HEAD WEIGHTS
+// ============================================================
+
+TOKEN_WEIGHTS() {wte}
+POSITION_WEIGHTS() {wpe}
+
+EMBED(IDS:POSITIONS) {
+    IDS:TOKEN_WEIGHTS() >> LOOKUP() >> T;
+    POSITIONS:POSITION_WEIGHTS() >> LOOKUP() >> PE;
+    T+PE >> B
+}
+
+LMHEAD(A) {
+    A >> TOKEN_WEIGHTS() >> W;
+    A*W^ >> B
+}
+
+
+// ============================================================
+// FORWARD
+//
+// B!, N1!, E!, and N2! are retained for the corresponding
+// reverse BLOCK instance.
+// ============================================================
+
+FORWARD(TOKEN_IN:POSITION_IDS:ATTENTION_MASK:TARGETS) {
+    TOKEN_IN:POSITION_IDS >> EMBED() >> X;
+
+    BLOCK/layers{
+        X >> B! >> LN1[]() >> N1!;
+
+        N1! >> *q[]:k[]:v[] +qb[]:kb[]:vb[] >[heads]> Q:K:V;
+        REPEAT/heads[]{
+            Q[]*K[]^ >> SCORES;
+            SCORES:ATTENTION_MASK >> SOFTMAX[]() >> PROBS;
+            PROBS*V[]
+        } >[]> *o[] +ob[] >> D;
+
+        D+B! >> E! >> LN2[]() >> N2! >> MLP[]() >> G;
+        G+E! >> X
+    };
+    X >> H;
+
+    H >> FINAL_LN() >> F;
+    F >> LMHEAD() >> LOGITS;
+    LOGITS:TARGETS >> CROSS_ENTROPY() >> LOSS;
+    LOSS:F:LOGITS:H
+}
+
+
+// ============================================================
+// BACKWARD
+//
+// BLOCK is the same named repeated scope as in FORWARD.
+// \layers walks the corresponding block instances in reverse order.
+// ============================================================
+
+BACKWARD(TOKEN_IN:POSITION_IDS:ATTENTION_MASK:TARGETS:F:LOGITS:H:LOSS) {
+    LOGITS:TARGETS >> CROSS_ENTROPY_BACK() >> DLOGITS;
+
+    F:DLOGITS >> LMHEAD_INPUT_GRAD() >> DF;
+    F:DLOGITS >> LMHEAD_WEIGHT_GRAD() >> DWTE_HEAD;
+
+    H:DF >> LN_INPUT_GRAD() >> DH;
+    H:DF >> LN_SCALE_GRAD() >> DLNF_SCALE;
+    H:DF >> LN_BIAS_GRAD() >> DLNF_BIAS;
+
+    BLOCK\layers{
+        // Second residual
+        DH >> DG;
+        DH >> DE_RES;
+
+        // MLP backward
+        N2!:DG >> MLP_INPUT_GRAD[]() >> DN2;
+        N2!:DG >> MLP_UP_GRAD[]() >> DUP;
+        N2!:DG >> MLP_UP_BIAS_GRAD[]() >> DUP_BIAS;
+        N2!:DG >> MLP_DOWN_GRAD[]() >> DDOWN;
+        N2!:DG >> MLP_DOWN_BIAS_GRAD[]() >> DDOWN_BIAS;
+
+        // Second layer norm backward
+        E!:DN2 >> LN_INPUT_GRAD[]() >> DE_LN;
+        E!:DN2 >> LN_SCALE_GRAD[]() >> DLN2_SCALE;
+        E!:DN2 >> LN_BIAS_GRAD[]() >> DLN2_BIAS;
+
+        DE_RES+DE_LN >> DE;
+
+        // First residual
+        DE >> DD;
+        DE >> DB_RES;
+
+        // Attention backward
+        N1!:ATTENTION_MASK:DD >> ATTN_INPUT_GRAD[]() >> DN1;
+        N1!:ATTENTION_MASK:DD >> ATTN_Q_GRAD[]() >> DQ;
+        N1!:ATTENTION_MASK:DD >> ATTN_K_GRAD[]() >> DK;
+        N1!:ATTENTION_MASK:DD >> ATTN_V_GRAD[]() >> DV;
+        N1!:ATTENTION_MASK:DD >> ATTN_O_GRAD[]() >> DO;
+
+        N1!:ATTENTION_MASK:DD >> ATTN_Q_BIAS_GRAD[]() >> DQB;
+        N1!:ATTENTION_MASK:DD >> ATTN_K_BIAS_GRAD[]() >> DKB;
+        N1!:ATTENTION_MASK:DD >> ATTN_V_BIAS_GRAD[]() >> DVB;
+        N1!:ATTENTION_MASK:DD >> ATTN_O_BIAS_GRAD[]() >> DOB;
+
+        // First layer norm backward
+        B!:DN1 >> LN_INPUT_GRAD[]() >> DB_LN;
+        B!:DN1 >> LN_SCALE_GRAD[]() >> DLN1_SCALE;
+        B!:DN1 >> LN_BIAS_GRAD[]() >> DLN1_BIAS;
+
+        DB_RES+DB_LN >> DB;
+
+        // SGD weight updates for this BLOCK instance
+        DQ*eta >> UQ;
+        q[]-UQ >> q[];
+
+        DK*eta >> UK;
+        k[]-UK >> k[];
+
+        DV*eta >> UV;
+        v[]-UV >> v[];
+
+        DO*eta >> UO;
+        o[]-UO >> o[];
+
+        DQB*eta >> UQB;
+        qb[]-UQB >> qb[];
+
+        DKB*eta >> UKB;
+        kb[]-UKB >> kb[];
+
+        DVB*eta >> UVB;
+        vb[]-UVB >> vb[];
+
+        DOB*eta >> UOB;
+        ob[]-UOB >> ob[];
+
+        DUP*eta >> UUP;
+        up[]-UUP >> up[];
+
+        DDOWN*eta >> UDOWN;
+        down[]-UDOWN >> down[];
+
+        DUP_BIAS*eta >> UUP_BIAS;
+        up_bias[]-UUP_BIAS >> up_bias[];
+
+        DDOWN_BIAS*eta >> UDOWN_BIAS;
+        down_bias[]-UDOWN_BIAS >> down_bias[];
+
+        DLN1_SCALE*eta >> ULN1_SCALE;
+        ln1_scale[]-ULN1_SCALE >> ln1_scale[];
+
+        DLN1_BIAS*eta >> ULN1_BIAS;
+        ln1_bias[]-ULN1_BIAS >> ln1_bias[];
+
+        DLN2_SCALE*eta >> ULN2_SCALE;
+        ln2_scale[]-ULN2_SCALE >> ln2_scale[];
+
+        DLN2_BIAS*eta >> ULN2_BIAS;
+        ln2_bias[]-ULN2_BIAS >> ln2_bias[];
+
+        DB >> DH
+    };
+    DH >> D_EMBED;
+
+    // Embedding gradients
+    TOKEN_IN:D_EMBED >> LOOKUP_GRAD() >> DWTE_EMBED;
+    POSITION_IDS:D_EMBED >> LOOKUP_GRAD() >> DWPE;
+
+    // wte is shared by EMBED and LMHEAD
+    DWTE_EMBED+DWTE_HEAD >> DWTE;
+
+    DWTE*eta >> UWTE;
+    wte-UWTE >> wte;
+
+    DWPE*eta >> UWPE;
+    wpe-UWPE >> wpe;
+
+    DLNF_SCALE*eta >> ULNF_SCALE;
+    lnf_scale-ULNF_SCALE >> lnf_scale;
+
+    DLNF_BIAS*eta >> ULNF_BIAS;
+    lnf_bias-ULNF_BIAS >> lnf_bias;
+    LOSS
+}
+
+
+// ============================================================
+// COMPLETE TRAINING STEP
+// ============================================================
+
+CHATGPT2_TRAINING(TEXT_IN) {
+    TEXT_IN >> TRAIN_TOKENIZE() >>
+        TOKEN_IN:ATTENTION_MASK:POSITION_IDS:TARGETS;
+
+    TOKEN_IN:POSITION_IDS:ATTENTION_MASK:TARGETS >> FORWARD() >> LOSS:F:LOGITS:H;
+
+    TOKEN_IN:POSITION_IDS:ATTENTION_MASK:TARGETS:F:LOGITS:H:LOSS >> BACKWARD() >> LOSS
+}

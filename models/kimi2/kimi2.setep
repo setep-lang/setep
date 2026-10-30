@@ -1,0 +1,234 @@
+// Kimi K2 Instruct
+// Source: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
+// Checked 2026-09-29. See README.md for sources, assumptions and limitations.
+// BF16 text-only, stateless prefill; no KV cache, vision encoder or training.
+// ALL-EXPERT UPPER-BOUND GRAPH: every expert processes every input token.
+// active_experts affects the traffic estimate only; executable graphs stay all-expert.
+
+tokens = 1024
+layers = 61
+model_width = 7168
+ff_width = 18432
+expert_width = 2048
+heads = 64
+kv_heads = 64
+head_dim = 128
+vocab_size = 163840
+experts = 384
+active_experts = 8
+query_width = 8192
+kv_width = 8192
+dense_layers = 1
+moe_layers = 60
+q_rank = 1536
+kv_rank = 512
+q_projection_width = 12288
+kv_compressed_width = 576
+kv_projection_width = 16384
+attention_output_width = 8192
+rope_dim = 64
+
+// Runtime hooks are shape contracts, not pretrained implementations.
+embedding = vocab_size%model_width@bf16
+lm_head = model_width%vocab_size@bf16
+final_norm = 1%model_width@bf16
+
+TOKEN_IN = tokens@int32
+A = tokens%model_width@bf16
+B = tokens%model_width@bf16
+N = tokens%model_width@bf16
+F = tokens%model_width@bf16
+H = tokens%model_width@bf16
+Q = tokens%query_width@bf16
+K = tokens%kv_width@bf16
+V = tokens%kv_width@bf16
+QR = tokens%query_width@bf16
+KR = tokens%kv_width@bf16
+KE = tokens%query_width@bf16
+VE = tokens%query_width@bf16
+CORE = tokens%query_width@bf16
+LOGITS = tokens%vocab_size@bf16
+
+X = tokens%model_width@bf16
+Y = tokens%model_width@bf16
+Z = tokens%model_width@bf16
+G = tokens%expert_width@bf16
+U = tokens%expert_width@bf16
+W = tokens%1@bf16
+POSITIONS = tokens@int32
+ASSIGNMENTS = tokens%active_experts@int32
+PROBABILITIES = tokens%active_experts@bf16
+
+QL = tokens%q_rank@bf16
+QNORM = tokens%q_rank@bf16
+QALL = tokens%q_projection_width@bf16
+C = tokens%kv_rank@bf16
+CNORM = tokens%kv_rank@bf16
+KROPE = tokens%rope_dim@bf16
+KRP = tokens%rope_dim@bf16
+QN = tokens%head_dim@bf16
+QROPE = tokens%rope_dim@bf16
+QRP = tokens%rope_dim@bf16
+KN = tokens%head_dim@bf16
+VALUE = tokens%head_dim@bf16
+
+// Separate parameter banks for each layer family within a repeated group.
+dense_layer_attn_norm[dense_layers] = 1%model_width@bf16
+dense_layer_dense_down[dense_layers] = ff_width%model_width@bf16
+dense_layer_dense_gate[dense_layers] = model_width%ff_width@bf16
+dense_layer_dense_up[dense_layers] = model_width%ff_width@bf16
+dense_layer_ffn_norm[dense_layers] = 1%model_width@bf16
+dense_layer_kv_a[dense_layers] = model_width%kv_compressed_width@bf16
+dense_layer_kv_b[dense_layers] = kv_rank%kv_projection_width@bf16
+dense_layer_kv_norm[dense_layers] = 1%kv_rank@bf16
+dense_layer_mla_o[dense_layers] = attention_output_width%model_width@bf16
+dense_layer_q_a[dense_layers] = model_width%q_rank@bf16
+dense_layer_q_b[dense_layers] = q_rank%q_projection_width@bf16
+dense_layer_q_norm[dense_layers] = 1%q_rank@bf16
+
+moe_layer_attn_norm[moe_layers] = 1%model_width@bf16
+moe_layer_down = expert_width%model_width@bf16
+moe_layer_ffn_norm[moe_layers] = 1%model_width@bf16
+moe_layer_gate = model_width%expert_width@bf16
+moe_layer_kv_a[moe_layers] = model_width%kv_compressed_width@bf16
+moe_layer_kv_b[moe_layers] = kv_rank%kv_projection_width@bf16
+moe_layer_kv_norm[moe_layers] = 1%kv_rank@bf16
+moe_layer_mla_o[moe_layers] = attention_output_width%model_width@bf16
+moe_layer_q_a[moe_layers] = model_width%q_rank@bf16
+moe_layer_q_b[moe_layers] = q_rank%q_projection_width@bf16
+moe_layer_q_norm[moe_layers] = 1%q_rank@bf16
+moe_layer_router[moe_layers] = model_width%experts@bf16
+moe_layer_shared_down[moe_layers] = expert_width%model_width@bf16
+moe_layer_shared_gate[moe_layers] = model_width%expert_width@bf16
+moe_layer_shared_up[moe_layers] = model_width%expert_width@bf16
+moe_layer_up = model_width%expert_width@bf16
+
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+EMBED(TOKEN_IN:A) {}
+
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RMSNORM(QL:A) {ops_per_element = 5}
+
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_KV_LATENT(A) {ops_per_element = 0}
+
+// Uncalibrated estimate: Two multiplies and one add per element; assumes precomputed sin/cos, whose reads are not modeled.
+ROPE(KROPE) {ops_per_element = 3}
+
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_Q(QH) {ops_per_element = 0}
+
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+SPLIT_KV(KVH) {ops_per_element = 0}
+
+SCALE_CAUSAL_MASK(A) {}
+
+DENSE_LAYER_MLA(A) {
+    A*dense_layer_q_a >> QL;
+    QL:dense_layer_q_norm >> RMSNORM() >> QNORM;
+    QNORM*dense_layer_q_b >> QALL;
+    A*dense_layer_kv_a >> SPLIT_KV_LATENT() >> C:KROPE;
+    C:dense_layer_kv_norm >> RMSNORM() >> CNORM;
+    CNORM*dense_layer_kv_b >> KV;
+    KROPE >> ROPE() >> KRP;
+    QALL:KV >[heads]> QH:KVH;
+    REPEAT/heads[]{
+        QH[] >> SPLIT_Q() >> QN:QROPE;
+        KVH[] >> SPLIT_KV() >> KN:VALUE;
+        QROPE >> ROPE() >> QRP;
+        QN*KN^ >> S1;
+        QRP*KRP^ >> S2;
+        {S1+S2} >> SCALE_CAUSAL_MASK() >> SOFTMAX_LAST() >> *VALUE
+    } >[]> {*dense_layer_mla_o} >> B
+}
+
+// Uncalibrated estimate: Five scalar operations per element; exp/div each count as one, not calibrated hardware latency.
+SILU(A) {ops_per_element = 5}
+
+DENSE_LAYER_DENSE_FF(A) {
+    A*dense_layer_dense_gate >> SILU() >> DG;
+    A*dense_layer_dense_up >> DU;
+    DG:DU >> MUL_ELEMENTS() >> DT;
+    DT*dense_layer_dense_down >> B
+}
+
+DENSE_LAYER(A) {
+    A:dense_layer_attn_norm >> RMSNORM() >> N;
+    N >> DENSE_LAYER_MLA() >> D;
+    A+D >> H;
+    H:dense_layer_ffn_norm >> RMSNORM() >> N;
+    N >> DENSE_LAYER_DENSE_FF() >> F;
+    H+F >> B
+}
+
+MOE_LAYER_MLA(A) {
+    A*moe_layer_q_a >> QL;
+    QL:moe_layer_q_norm >> RMSNORM() >> QNORM;
+    QNORM*moe_layer_q_b >> QALL;
+    A*moe_layer_kv_a >> SPLIT_KV_LATENT() >> C:KROPE;
+    C:moe_layer_kv_norm >> RMSNORM() >> CNORM;
+    CNORM*moe_layer_kv_b >> KV;
+    KROPE >> ROPE() >> KRP;
+    QALL:KV >[heads]> QH:KVH;
+    REPEAT/heads[]{
+        QH[] >> SPLIT_Q() >> QN:QROPE;
+        KVH[] >> SPLIT_KV() >> KN:VALUE;
+        QROPE >> ROPE() >> QRP;
+        QN*KN^ >> S1;
+        QRP*KRP^ >> S2;
+        {S1+S2} >> SCALE_CAUSAL_MASK() >> SOFTMAX_LAST() >> *VALUE
+    } >[]> {*moe_layer_mla_o} >> B
+}
+
+// Default cost placeholder: routing selection costs depend on expert count and selection algorithm.
+ROUTER(A) {}
+
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+DISPATCH(A:B:C) {ops_per_element = 0}
+
+MOE_LAYER_EXPERT(A) {
+    A*moe_layer_gate[] >> SILU() >> G;
+    A*moe_layer_up[] >> U;
+    G:U >> MUL_ELEMENTS() >> T;
+    T*moe_layer_down[] >> B
+}
+
+SCALE_ROUTED(Y:W) {}
+
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+SCATTER(Y:POSITIONS:A) {ops_per_element = 0}
+
+MOE_LAYER_SHARED_EXPERT(A) {
+    A*moe_layer_shared_gate >> SILU() >> G;
+    A*moe_layer_shared_up >> U;
+    G:U >> MUL_ELEMENTS() >> T;
+    T*moe_layer_shared_down >> B
+}
+
+MOE_LAYER_MOE(A) {
+    {A*moe_layer_router} >> ROUTER() >> ASSIGNMENTS:PROBABILITIES;
+    A:ASSIGNMENTS:PROBABILITIES >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> MOE_LAYER_EXPERT[]() >> Y;
+        Y:W >> SCALE_ROUTED() >> Y;
+        Y:POSITIONS:A >> SCATTER() >> Z
+    } >+[]> R;
+    A >> MOE_LAYER_SHARED_EXPERT() >> S;
+    R+S >> B
+}
+
+MOE_LAYER(A) {
+    A:moe_layer_attn_norm >> RMSNORM() >> N;
+    N >> MOE_LAYER_MLA() >> D;
+    A+D >> H;
+    H:moe_layer_ffn_norm >> RMSNORM() >> N;
+    N >> MOE_LAYER_MOE() >> F;
+    H+F >> B
+}
+
+KIMI2(TOKEN_IN) {
+    TOKEN_IN:embedding >> EMBED() >> A;
+    A >> REPEAT/dense_layers{DENSE_LAYER[]()} >> REPEAT/moe_layers{MOE_LAYER[]()} >> H;
+    H:final_norm >> RMSNORM() >> N;
+    N*lm_head >> LOGITS
+}

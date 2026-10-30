@@ -1,0 +1,231 @@
+// gpt-oss-120b
+// Source: https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
+// Checked 2026-09-29. See README.md for sources, assumptions and limitations.
+// BF16 text-only, stateless prefill; no KV cache, vision encoder or training.
+// ALL-EXPERT UPPER-BOUND GRAPH: every expert processes every input token.
+// active_experts affects the traffic estimate only; executable graphs stay all-expert.
+
+tokens = 1
+layers = 36
+model_width = 2880
+ff_width = 2880
+expert_width = 2880
+heads = 64
+kv_heads = 8
+head_dim = 64
+vocab_size = 201088
+experts = 128
+active_experts = 4
+query_width = 4096
+kv_width = 512
+layer_pairs = 18
+sliding_window = 128
+
+// Runtime hooks are shape contracts, not pretrained implementations.
+embedding = vocab_size%model_width@bf16
+lm_head = model_width%vocab_size@bf16
+final_norm = 1%model_width@fp32
+
+TOKEN_IN = tokens@int32
+A = tokens%model_width@bf16
+B = tokens%model_width@bf16
+N = tokens%model_width@bf16
+F = tokens%model_width@bf16
+H = tokens%model_width@bf16
+Q = tokens%query_width@bf16
+K = tokens%kv_width@bf16
+V = tokens%kv_width@bf16
+QR = tokens%query_width@bf16
+KR = tokens%kv_width@bf16
+KE = tokens%query_width@bf16
+VE = tokens%query_width@bf16
+CORE = tokens%query_width@bf16
+LOGITS = tokens%vocab_size@bf16
+
+// Original attention and expert linear layers have biases; norms use FP32.
+
+SCORES = tokens%tokens@bf16
+PROBS = tokens%tokens@bf16
+
+X = tokens%model_width@bf16
+Y = tokens%model_width@bf16
+Z = tokens%model_width@bf16
+G = tokens%expert_width@bf16
+U = tokens%expert_width@bf16
+W = tokens%1@bf16
+POSITIONS = tokens@int32
+ASSIGNMENTS = tokens%active_experts@int32
+PROBABILITIES = tokens%active_experts@bf16
+
+// Separate parameter banks for each layer family within a repeated group.
+window_layer_attn_norm[layer_pairs] = 1%model_width@fp32
+window_layer_bk[layer_pairs] = 1%kv_width@bf16
+window_layer_bo[layer_pairs] = 1%model_width@bf16
+window_layer_bq[layer_pairs] = 1%query_width@bf16
+window_layer_bv[layer_pairs] = 1%kv_width@bf16
+window_layer_down = expert_width%model_width@bf16
+window_layer_down_bias = 1%model_width@bf16
+window_layer_ffn_norm[layer_pairs] = 1%model_width@fp32
+window_layer_gate = model_width%expert_width@bf16
+window_layer_gate_bias = 1%expert_width@bf16
+window_layer_router[layer_pairs] = model_width%experts@bf16
+window_layer_router_bias[layer_pairs] = 1%experts@bf16
+window_layer_sinks[layer_pairs] = 1%heads@bf16
+window_layer_up = model_width%expert_width@bf16
+window_layer_up_bias = 1%expert_width@bf16
+window_layer_wk[layer_pairs] = model_width%kv_width@bf16
+window_layer_wo[layer_pairs] = query_width%model_width@bf16
+window_layer_wq[layer_pairs] = model_width%query_width@bf16
+window_layer_wv[layer_pairs] = model_width%kv_width@bf16
+
+full_layer_attn_norm[layer_pairs] = 1%model_width@fp32
+full_layer_bk[layer_pairs] = 1%kv_width@bf16
+full_layer_bo[layer_pairs] = 1%model_width@bf16
+full_layer_bq[layer_pairs] = 1%query_width@bf16
+full_layer_bv[layer_pairs] = 1%kv_width@bf16
+full_layer_down = expert_width%model_width@bf16
+full_layer_down_bias = 1%model_width@bf16
+full_layer_ffn_norm[layer_pairs] = 1%model_width@fp32
+full_layer_gate = model_width%expert_width@bf16
+full_layer_gate_bias = 1%expert_width@bf16
+full_layer_router[layer_pairs] = model_width%experts@bf16
+full_layer_router_bias[layer_pairs] = 1%experts@bf16
+full_layer_sinks[layer_pairs] = 1%heads@bf16
+full_layer_up = model_width%expert_width@bf16
+full_layer_up_bias = 1%expert_width@bf16
+full_layer_wk[layer_pairs] = model_width%kv_width@bf16
+full_layer_wo[layer_pairs] = query_width%model_width@bf16
+full_layer_wq[layer_pairs] = model_width%query_width@bf16
+full_layer_wv[layer_pairs] = model_width%kv_width@bf16
+
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+EMBED(TOKEN_IN:A) {}
+
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RMSNORM(A:B) {ops_per_element = 5}
+
+// Uncalibrated estimate: Two multiplies and one add per Q/K element; assumes precomputed sin/cos, whose reads are not modeled.
+ROPE_PAIR(Q:K) {ops_per_element = 3}
+
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+EXPAND_KV(KK:VV) {ops_per_element = 0}
+
+WINDOW_SINK_SOFTMAX(SCORES:SINK) {}
+
+WINDOW_LAYER_CORE_CHUNK(QQ:KK:VV) {
+    KK:VV >> EXPAND_KV() >> KE:VE;
+    QQ:KE:VE >[heads]> QH:KH:VH;
+    window_layer_sinks >[heads]> SINK;
+    REPEAT/heads[]{
+        QH[]*KH[]^ >> SCORES;
+        SCORES:SINK[] >> WINDOW_SINK_SOFTMAX() >> PROBS;
+        PROBS*VH[]
+    } >[]> CORE
+}
+
+WINDOW_LAYER_ATTENTION_CHUNK(A) {
+    {A*window_layer_wq+window_layer_bq} >> Q;
+    {A*window_layer_wk+window_layer_bk} >> K;
+    {A*window_layer_wv+window_layer_bv} >> V;
+    Q:K >> ROPE_PAIR() >> QR:KR;
+    QR:KR:V >> WINDOW_LAYER_CORE_CHUNK() >> CORE;
+    {CORE*window_layer_wo+window_layer_bo} >> B
+}
+
+// Default cost placeholder: routing selection costs depend on expert count and selection algorithm.
+ROUTER(A) {}
+
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+DISPATCH(A:B:C) {ops_per_element = 0}
+
+CLAMPED_SWIGLU(G:U) {}
+
+WINDOW_LAYER_EXPERT(A) {
+    {A*window_layer_gate[]+window_layer_gate_bias[]} >> G;
+    {A*window_layer_up[]+window_layer_up_bias[]} >> U;
+    G:U >> CLAMPED_SWIGLU() >> T;
+    {T*window_layer_down[]+window_layer_down_bias[]} >> B
+}
+
+SCALE_ROUTED(Y:W) {}
+
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+SCATTER(Y:POSITIONS:A) {ops_per_element = 0}
+
+WINDOW_LAYER_MOE(A) {
+    {A*window_layer_router+window_layer_router_bias} >> ROUTER() >> ASSIGNMENTS:PROBABILITIES;
+    A:ASSIGNMENTS:PROBABILITIES >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> WINDOW_LAYER_EXPERT[]() >> Y;
+        Y:W >> SCALE_ROUTED() >> Y;
+        Y:POSITIONS:A >> SCATTER() >> Z
+    } >+[]> R;
+    R >> B
+}
+
+WINDOW_LAYER(A) {
+    A:window_layer_attn_norm >> RMSNORM() >> N;
+    N >> WINDOW_LAYER_ATTENTION_CHUNK() >> D;
+    A+D >> H;
+    H:window_layer_ffn_norm >> RMSNORM() >> N;
+    N >> WINDOW_LAYER_MOE() >> F;
+    H+F >> B
+}
+
+FULL_SINK_SOFTMAX(SCORES:SINK) {}
+
+FULL_LAYER_CORE_FULL(QQ:KK:VV) {
+    KK:VV >> EXPAND_KV() >> KE:VE;
+    QQ:KE:VE >[heads]> QH:KH:VH;
+    full_layer_sinks >[heads]> SINK;
+    REPEAT/heads[]{
+        QH[]*KH[]^ >> SCORES;
+        SCORES:SINK[] >> FULL_SINK_SOFTMAX() >> PROBS;
+        PROBS*VH[]
+    } >[]> CORE
+}
+
+FULL_LAYER_ATTENTION_FULL(A) {
+    {A*full_layer_wq+full_layer_bq} >> Q;
+    {A*full_layer_wk+full_layer_bk} >> K;
+    {A*full_layer_wv+full_layer_bv} >> V;
+    Q:K >> ROPE_PAIR() >> QR:KR;
+    QR:KR:V >> FULL_LAYER_CORE_FULL() >> CORE;
+    {CORE*full_layer_wo+full_layer_bo} >> B
+}
+
+FULL_LAYER_EXPERT(A) {
+    {A*full_layer_gate[]+full_layer_gate_bias[]} >> G;
+    {A*full_layer_up[]+full_layer_up_bias[]} >> U;
+    G:U >> CLAMPED_SWIGLU() >> T;
+    {T*full_layer_down[]+full_layer_down_bias[]} >> B
+}
+
+FULL_LAYER_MOE(A) {
+    {A*full_layer_router+full_layer_router_bias} >> ROUTER() >> ASSIGNMENTS:PROBABILITIES;
+    A:ASSIGNMENTS:PROBABILITIES >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:POSITIONS;
+        X >> FULL_LAYER_EXPERT[]() >> Y;
+        Y:W >> SCALE_ROUTED() >> Y;
+        Y:POSITIONS:A >> SCATTER() >> Z
+    } >+[]> R;
+    R >> B
+}
+
+FULL_LAYER(A) {
+    A:full_layer_attn_norm >> RMSNORM() >> N;
+    N >> FULL_LAYER_ATTENTION_FULL() >> D;
+    A+D >> H;
+    H:full_layer_ffn_norm >> RMSNORM() >> N;
+    N >> FULL_LAYER_MOE() >> F;
+    H+F >> B
+}
+
+TWO_LAYERS(A) {A >> WINDOW_LAYER[]() >> FULL_LAYER[]() >> B}
+
+GPT_OSS(TOKEN_IN) {
+    TOKEN_IN:embedding >> EMBED() >> A;
+    A >> REPEAT/layer_pairs{TWO_LAYERS[]()} >> H;
+    H:final_norm >> RMSNORM() >> N;
+    N*lm_head >> LOGITS
+}

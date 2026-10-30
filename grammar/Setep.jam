@@ -1,0 +1,43 @@
+card : number | lowerName ;
+
+name : upperName | lowerName;
+
+valueName : name [ "[" [card] "]" ] ;
+
+value : valueName [ "(" ")" ] ["^"] ;
+
+shapeDim : card>dim [ "[" card>split "]" ] ;
+
+shape : shapeDim { "%" shapeDim } ["@" lowerName] ;
+
+group : value  { ":" value }  ;
+
+transferOp : ">" ["+" ] [ ":" | "[" [card] "]" ] ">" ;
+
+scopeOp : "+" | "-" | "*" ;
+
+scopeArg : scope | group ;
+
+scopeExpr : [scopeOp>first] scopeArg {scopeOp  scopeArg} ;
+
+scopeSep : "|" | transferOp;
+
+scopeStmt : scopeExpr ["=" shape] { scopeSep scopeExpr } ;
+
+scopeBody : scopeStmt {";" scopeStmt} ;
+
+repDirection : "/" | "\\" ;
+
+repType : [card] ["[" "]"] ;
+
+repetition : repDirection repType ;
+
+choice : "?" upperName>choiceComp ["[" "]"] "(" ")" ;
+
+scopeName : upperName>scopeName [ repetition ] [choice] ;
+
+scope : [scopeName] "{" scopeBody "}" ;
+
+compDef : upperName ["(" [upperName {":" upperName}] ")"] "{" [scopeBody] "}" ;
+
+setepModel : { compDef | scopeStmt } ;

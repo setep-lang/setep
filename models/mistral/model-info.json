@@ -1,0 +1,27 @@
+{
+  "label": "Mistral Medium 3.5 128B (text decoder)",
+  "family": "dense",
+  "layers": 88,
+  "model_width": 12288,
+  "ff_width": 28672,
+  "heads": 96,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "vocab_size": 131072,
+  "source": "https://huggingface.co/mistralai/Mistral-Medium-3.5-128B/blob/f38972c0ef3023b423b0c9157edb11d02c865b28/config.json",
+  "checked_on": "2026-09-29",
+  "file": "mistral.setep",
+  "status": "published_text_architecture",
+  "scalars": {
+    "tokens": 1,
+    "layers": 88,
+    "model_width": 12288,
+    "ff_width": 28672,
+    "heads": 96,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 131072,
+    "query_width": 12288,
+    "kv_width": 1024
+  }
+}

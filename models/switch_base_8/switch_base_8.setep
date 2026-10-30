@@ -1,0 +1,247 @@
+// ============================================================
+// SWITCH TRANSFORMER BASE-8
+// ============================================================
+
+text_in = 100
+text_out = 100
+tokens = 32
+decode_tokens = 32
+positions = 512
+
+encoder_layers = 12
+decoder_layers = 12
+heads = 12
+experts = 8
+
+model_width = 768
+ff_width = 3072
+head_width = 64
+vocab_size = 32128
+
+TEXT_IN = text_in@int8
+// TEXT_OUT has variable byte length, determined by DETOKENIZE().
+
+TOKEN_IN = tokens@int32
+TOKEN = 1@int32
+ATTENTION_MASK = tokens@int32
+POSITION_IDS = tokens@int32
+
+// Shared token embedding / LM-head weights.
+wte = vocab_size%model_width@fp32
+
+// Decoder self-attention projections are shared between prefill and decode.
+self_q[decoder_layers] = model_width%model_width@fp32
+self_k[decoder_layers] = model_width%model_width@fp32
+self_v[decoder_layers] = model_width%model_width@fp32
+self_o[decoder_layers] = model_width%model_width@fp32
+
+// Opaque operations supply tokenizer, masks, normalization and routing behavior.
+TOKENIZE(TEXT_IN) {}
+DETOKENIZE(TOKENS) {}
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+LOOKUP(IDS:A) {}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RMSNORM(X) {ops_per_element = 5}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+SOFTMAX(BIASED:MASK) {ops_per_element = 5}
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RELU(A) {ops_per_element = 1}
+SAMPLE(A) {}
+RELATIVE_POSITION_BIAS(SCORES) {}
+DECODE_PREP(TOKEN) {}
+CAUSAL_MASK(SCORES) {}
+// Return decoder_start_token_id as a one-element integer tensor.
+DECODER_START(ENC) {}
+// ROUTE computes per-token expert IDs and probabilities from router logits.
+// Apply capacity limits here; mark overflow tokens with an unassigned ID.
+// Default cost placeholder: routing selection costs depend on expert count and selection algorithm.
+ROUTE(ROUTER_LOGITS) {}
+// DISPATCH[] receives the expert index as instance_path[-1] and gathers
+// assigned token rows, routing probabilities, and original token positions.
+// Empty experts return empty tensors with their feature dimension preserved.
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+DISPATCH(A:B:C) {ops_per_element = 0}
+// SCALE multiplies each output row by its routing probability (not matmul).
+SCALE(Y:W) {}
+// SCATTER uses A as a shape template and restores selected rows into zeros.
+// Payload-copy estimate: zero arithmetic, default reads/writes; indexing, selection and zero-fill costs omitted.
+SCATTER(Y:TOKEN_POSITIONS:A) {ops_per_element = 0}
+// Preserve the reference model's handling of capacity-overflow tokens.
+// Assigned tokens use the reduced expert outputs; unassigned tokens use
+// the reference fallback (zero FF contribution in transformers 4.57.6).
+COMBINE_ROUTED(A:ROUTED:EXPERT_ID:WEIGHT) {}
+SELECT_ENCODER_FF(A) {}
+SELECT_DECODER_FF(A) {}
+
+TOKEN_WEIGHTS() {wte}
+EMBED(IDS) {
+    IDS:TOKEN_WEIGHTS() >> LOOKUP() >> B
+}
+LMHEAD(A) {
+    TOKEN_WEIGHTS() >> W;
+    A*W^ >> B
+}
+
+// Computation-local declarations keep encoder and decoder weights distinct.
+ENCODER_DENSE_FF(A) {
+    wi[encoder_layers] = model_width%ff_width@fp32;
+    wo[encoder_layers] = ff_width%model_width@fp32;
+    A >> *wi >> RELU() >> *wo >> B
+}
+DECODER_DENSE_FF(A) {
+    wi[decoder_layers] = model_width%ff_width@fp32;
+    wo[decoder_layers] = ff_width%model_width@fp32;
+    A >> *wi >> RELU() >> *wo >> B
+}
+ENCODER_EXPERT(A) {
+    wi[experts] = model_width%ff_width@fp32;
+    wo[experts] = ff_width%model_width@fp32;
+    A >> *wi >> RELU() >> *wo >> B
+}
+DECODER_EXPERT(A) {
+    wi[experts] = model_width%ff_width@fp32;
+    wo[experts] = ff_width%model_width@fp32;
+    A >> *wi >> RELU() >> *wo >> B
+}
+ENCODER_SWITCH_FF(A) {
+    router[encoder_layers] = model_width%experts@fp32;
+    A >> *router >> ROUTER_LOGITS;
+    ROUTER_LOGITS >> ROUTE() >> EXPERT_ID:WEIGHT;
+    A:EXPERT_ID:WEIGHT >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:TOKEN_POSITIONS;
+        X >> ENCODER_EXPERT[]() >> Y;
+        Y:W >> SCALE() >> Y;
+        Y:TOKEN_POSITIONS:A >> SCATTER() >> Z
+    } >+[]> ROUTED;
+    A:ROUTED:EXPERT_ID:WEIGHT >> COMBINE_ROUTED() >> B
+}
+DECODER_SWITCH_FF(A) {
+    router[decoder_layers] = model_width%experts@fp32;
+    A >> *router >> ROUTER_LOGITS;
+    ROUTER_LOGITS >> ROUTE() >> EXPERT_ID:WEIGHT;
+    A:EXPERT_ID:WEIGHT >> REPEAT/experts[]{
+        DISPATCH[]() >> X:W:TOKEN_POSITIONS;
+        X >> DECODER_EXPERT[]() >> Y;
+        Y:W >> SCALE() >> Y;
+        Y:TOKEN_POSITIONS:A >> SCATTER() >> Z
+    } >+[]> ROUTED;
+    A:ROUTED:EXPERT_ID:WEIGHT >> COMBINE_ROUTED() >> B
+}
+
+// Encoder SOFTMAX must implement bidirectional attention with padding masking.
+ENCODER_ATTENTION(A:MASK) {
+    q[encoder_layers] = model_width%model_width@fp32;
+    k[encoder_layers] = model_width%model_width@fp32;
+    v[encoder_layers] = model_width%model_width@fp32;
+    o[encoder_layers] = model_width%model_width@fp32;
+    A >> *q:k:v >[heads]> Q:K:V;
+    REPEAT/heads[]{
+        Q[]*K[]^ >> SCORES;
+        SCORES >> RELATIVE_POSITION_BIAS[]() >> RPB;
+        SCORES+RPB >> BIASED;
+        BIASED:MASK >> SOFTMAX() >> PROBS;
+        PROBS*V[]
+    } >[]> *o >> B
+}
+
+// The matching named SELF_CACHE scopes share K!/V! by decoder layer index.
+// Decoder SOFTMAX must implement causal attention.
+DECODER_SELF_PREFILL(A) {
+    A >> SELF_CACHE{
+        A >> *self_q:self_k:self_v >> Q:K:V;
+        K >> K!;
+        V >> V!;
+        Q:K!:V! >[heads]> Q_HEAD:K_HEAD:V_HEAD;
+        REPEAT/heads[]{
+            Q_HEAD[]*K_HEAD[]^ >> SCORES;
+            SCORES >> RELATIVE_POSITION_BIAS[]() >> RPB;
+            SCORES >> CAUSAL_MASK() >> MASK;
+            SCORES+RPB >> BIASED;
+            BIASED:MASK >> SOFTMAX() >> PROBS;
+            PROBS*V_HEAD[]
+        } >[]> *self_o >> B
+    }
+}
+DECODER_SELF_DECODE(A) {
+    A >> SELF_CACHE{
+        A >> *self_q:self_k:self_v >> Q:K:V;
+        K!^:K^ >:> NEXT_K;
+        NEXT_K^ >> K!;
+        V!^:V^ >:> NEXT_V;
+        NEXT_V^ >> V!;
+        Q:K!:V! >[heads]> Q_HEAD:K_HEAD:V_HEAD;
+        REPEAT/heads[]{
+            Q_HEAD[]*K_HEAD[]^ >> SCORES;
+            SCORES >> RELATIVE_POSITION_BIAS[]() >> RPB;
+            SCORES >> CAUSAL_MASK() >> MASK;
+            SCORES+RPB >> BIASED;
+            BIASED:MASK >> SOFTMAX() >> PROBS;
+            PROBS*V_HEAD[]
+        } >[]> *self_o >> B
+    }
+}
+
+CROSS_ATTENTION(DEC:ENC:MASK) {
+    q[decoder_layers] = model_width%model_width@fp32;
+    k[decoder_layers] = model_width%model_width@fp32;
+    v[decoder_layers] = model_width%model_width@fp32;
+    o[decoder_layers] = model_width%model_width@fp32;
+    DEC >> *q >[heads]> Q;
+    ENC >> *k:v >[heads]> K:V;
+    REPEAT/heads[]{
+        Q[]*K[]^ >> SCORES;
+        SCORES:MASK >> SOFTMAX() >> PROBS;
+        PROBS*V[]
+    } >[]> *o >> B
+}
+
+// Selectors choose dense or sparse FF according to the layer repetition index.
+ENCODER(TOKEN_IN:MASK) {
+    TOKEN_IN >> EMBED() >> X;
+    ENCODER_BLOCK/encoder_layers{
+        X >> RMSNORM[]() >> N1;
+        N1:MASK >> ENCODER_ATTENTION[]() >> SA;
+        X+SA >> E >> RMSNORM[]() >> N2;
+        N2 >> CHOOSE?SELECT_ENCODER_FF[](){ENCODER_DENSE_FF[]() | ENCODER_SWITCH_FF[]()} >> FF;
+        E+FF >> X
+    };
+    X >> RMSNORM() >> ENC
+}
+
+DECODER_PREFILL(TOKEN:ENC:MASK) {
+    TOKEN >> EMBED() >> X;
+    DECODER_BLOCK/decoder_layers{
+        X >> RMSNORM[]() >> DECODER_SELF_PREFILL[]() >> SA;
+        X+SA >> D1 >> RMSNORM[]() >> N2;
+        N2:ENC:MASK >> CROSS_ATTENTION[]() >> CA;
+        D1+CA >> D2 >> RMSNORM[]() >> N3;
+        N3 >> CHOOSE?SELECT_DECODER_FF[](){DECODER_DENSE_FF[]() | DECODER_SWITCH_FF[]()} >> FF;
+        D2+FF >> X
+    };
+    X >> RMSNORM() >> LMHEAD() >> SAMPLE() >> TOKEN
+}
+DECODER_DECODE(TOKEN:ENC:MASK) {
+    TOKEN >> DECODE_PREP() >> TOK >> EMBED() >> X;
+    DECODER_BLOCK/decoder_layers{
+        X >> RMSNORM[]() >> DECODER_SELF_DECODE[]() >> SA;
+        X+SA >> D1 >> RMSNORM[]() >> N2;
+        N2:ENC:MASK >> CROSS_ATTENTION[]() >> CA;
+        D1+CA >> D2 >> RMSNORM[]() >> N3;
+        N3 >> CHOOSE?SELECT_DECODER_FF[](){DECODER_DENSE_FF[]() | DECODER_SWITCH_FF[]()} >> FF;
+        D2+FF >> X
+    };
+    X >> RMSNORM() >> LMHEAD() >> SAMPLE() >> TOKEN
+}
+
+SWITCH_BASE_8(TEXT_IN) {
+    TEXT_IN >> TOKENIZE() >> TOKEN_IN:ATTENTION_MASK:POSITION_IDS;
+    TOKEN_IN:ATTENTION_MASK >> ENCODER() >> ENC;
+    ENC >> DECODER_START() >> TOKEN;
+    TOKEN:ENC:ATTENTION_MASK >> DECODER_PREFILL() >> TOKEN;
+    TOKEN >> TOKENS;
+    REPEAT/decode_tokens{
+        TOKEN:ENC:ATTENTION_MASK >> DECODER_DECODE() >> TOKEN;
+        TOKENS:TOKEN >:> TOKENS
+    };
+    TOKENS >> DETOKENIZE() >> TEXT_OUT
+}

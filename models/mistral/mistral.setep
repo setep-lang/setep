@@ -1,0 +1,101 @@
+// Mistral Medium 3.5 128B (text decoder)
+// Source: https://huggingface.co/mistralai/Mistral-Medium-3.5-128B/blob/f38972c0ef3023b423b0c9157edb11d02c865b28/config.json
+// Checked 2026-09-29. See README.md for sources, assumptions and limitations.
+// BF16 text-only, stateless prefill; no KV cache, vision encoder or training.
+
+tokens = 1
+layers = 88
+model_width = 12288
+ff_width = 28672
+heads = 96
+kv_heads = 8
+head_dim = 128
+vocab_size = 131072
+query_width = 12288
+kv_width = 1024
+
+// Runtime hooks are shape contracts, not pretrained implementations.
+embedding = vocab_size%model_width@bf16
+lm_head = model_width%vocab_size@bf16
+attn_norm[layers] = 1%model_width@bf16
+ffn_norm[layers] = 1%model_width@bf16
+final_norm = 1%model_width@bf16
+wq[layers] = model_width%query_width@bf16
+wk[layers] = model_width%kv_width@bf16
+wv[layers] = model_width%kv_width@bf16
+wo[layers] = query_width%model_width@bf16
+dense_gate[layers] = model_width%ff_width@bf16
+dense_up[layers] = model_width%ff_width@bf16
+dense_down[layers] = ff_width%model_width@bf16
+
+TOKEN_IN = tokens@int32
+A = tokens%model_width@bf16
+B = tokens%model_width@bf16
+N = tokens%model_width@bf16
+F = tokens%model_width@bf16
+H = tokens%model_width@bf16
+Q = tokens%query_width@bf16
+K = tokens%kv_width@bf16
+V = tokens%kv_width@bf16
+QR = tokens%query_width@bf16
+KR = tokens%kv_width@bf16
+KE = tokens%query_width@bf16
+VE = tokens%query_width@bf16
+CORE = tokens%query_width@bf16
+LOGITS = tokens%vocab_size@bf16
+
+
+// Default cost placeholder: selected embedding rows need token-dependent read accounting.
+EMBED(TOKEN_IN:A) {}
+
+// Uncalibrated cost estimate; omitted fields use the abstract defaults.
+RMSNORM(A:B) {ops_per_element = 5}
+
+// Uncalibrated estimate: Two multiplies and one add per Q/K element; assumes precomputed sin/cos, whose reads are not modeled.
+ROPE_PAIR(Q:K) {ops_per_element = 3}
+
+// Copy estimate: zero arithmetic, one input read/output write. A view may avoid these accesses.
+EXPAND_KV(KK:VV) {ops_per_element = 0}
+
+SCALE_CAUSAL_MASK(A) {}
+
+CORE_FULL(QQ:KK:VV) {
+    KK:VV >> EXPAND_KV() >> KE:VE;
+    QQ:KE:VE >[heads]> QH:KH:VH;
+    REPEAT/heads[]{QH[]*KH[]^ >> SCALE_CAUSAL_MASK() >> SOFTMAX_LAST() >> *VH[]} >[]> CORE
+}
+
+ATTENTION_FULL(A) {
+    {A*wq} >> Q;
+    {A*wk} >> K;
+    {A*wv} >> V;
+    Q:K >> ROPE_PAIR() >> QR:KR;
+    QR:KR:V >> CORE_FULL() >> CORE;
+    {CORE*wo} >> B
+}
+
+// Uncalibrated estimate: Five scalar operations per element; exp/div each count as one, not calibrated hardware latency.
+SILU(A) {ops_per_element = 5}
+
+DENSE_FF(A) {
+    A*dense_gate >> SILU() >> DG;
+    A*dense_up >> DU;
+    DG:DU >> MUL_ELEMENTS() >> DT;
+    DT*dense_down >> B
+}
+
+LAYER(A) {
+    A:attn_norm >> RMSNORM() >> N;
+    N >> ATTENTION_FULL() >> D;
+    A+D >> H;
+    H:ffn_norm >> RMSNORM() >> N;
+    N >> DENSE_FF() >> F;
+    H+F >> B
+}
+
+MISTRAL(TOKEN_IN) {
+    TOKEN_IN:embedding >> EMBED() >> A;
+    A >> REPEAT/layers{LAYER[]()} >> H;
+    H:final_norm >> RMSNORM() >> N;
+    N*lm_head >> LOGITS
+}

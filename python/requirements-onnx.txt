@@ -1,0 +1,3 @@
+# ONNX export (setep --onnx): the interpreter passed with --interpreter.
+numpy
+onnx==1.23.2

@@ -1,0 +1,5 @@
+# Paper evaluation (GPT-2 comparisons against Hugging Face).
+-r ../python/requirements-test.txt
+transformers
+safetensors
+tiktoken
