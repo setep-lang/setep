@@ -65,7 +65,7 @@ rows = [5.2, 3.0, 0.8]
 ax.plot([trunk, trunk], [rows[-1], rows[0]], color=INK2, lw=0.9)
 xs = 9.4
 names = [('Python emitter', 'model + setep.py'),
-         ('ONNX bridge', 'static graph'),
+         ('ONNX exporter', 'Python + onnx'),
          ('Graph builder', 'ops, shapes, costs')]
 for y, (t, sub) in zip(rows, names):
     arrow(ax, trunk, y, xs, y)
